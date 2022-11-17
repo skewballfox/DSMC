@@ -1,4 +1,8 @@
+#![allow(dead_code, unused_variables, unused_imports)]
+//TODO: remove this once I have some working code
+
 extern crate nalgebra as na;
+use clap::{Arg, Parser};
 use num::{Bounded, Integer};
 
 enum ParticleType {
@@ -12,6 +16,9 @@ struct Particle {
     particle_type: ParticleType,
     parent_cell: CellIndex,
 }
+use rand::thread_rng;
+
+const COLLISION_SIZE: f32 = 1e-28;
 /// Unique identifier for a cell on a grid, represented by an index triplet on the 3D cartesian grid
 ///
 /// The local indexing of points and edges are given as follows:
@@ -50,7 +57,6 @@ pub struct Cell {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-
 pub struct CellIndex {
     index: [u32; 3],
 }
@@ -72,9 +78,66 @@ fn collideParticles() {
     //  a collision conserves momentum and kinetic energy
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    ///switch to two dimensional mode (only one cell in z directions)
+    #[arg(long = "2d")]
+    two_dim: bool,
+    ///Number of cells in x direction
+    #[arg(long, long = "ni", default_value_t = 32)]
+    num_x: i32,
+    ///Number of cells in y direction
+    #[arg(long, long = "nj", default_value_t = 32)]
+    num_y: i32,
+    ///Number of cells in z direction
+    #[arg(long, long = "nk", default_value_t = 32)]
+    num_z: i32,
+    ///Mean Particles per Cell in simulation, adjust number of virtual
+    /// particles to meet this target for the inflow
+    #[arg(long, long = "mppc", default_value_t = 10)]
+    mean_particles_per_cell: i32,
+    ///Mach number or ratio of mean atom velocity versus mean thermal velocity
+    #[arg(long, long = "mach", default_value_t = 20.)]
+    mach_number: f32,
+    ///Density of the incoming flow
+    #[arg(long, long = "density", default_value_t = 1e30)]
+    density: f32,
+    //x-location of plate
+    #[arg(long, long = "px", default_value_t = -0.25)]
+    plate_x: f32,
+    ///y height of plate
+    #[arg(long, long = "platedy", default_value_t = 0.25)]
+    plate_height: f32,
+    ///z width of plate
+    #[arg(long, long = "platedz", default_value_t = 0.5)]
+    plate_width: f32,
+    ///simulation time step size (usually computed from the above parameters)
+    #[arg(long, long = "nk", default_value_t = 0)]
+    time_step: usize,
+}
 //collideParticles() : collision is a random process where the result of
 //a collision conserves momentum and kinetic energy
 // time-step is complete, continues
 fn main() {
+    let particles_per_particle = 1e27;
+    let mean_velocity = 1;
+    //struct destructuring for the win
+    let Args {
+        two_dim,
+        num_x,
+        num_y,
+        num_z,
+        mean_particles_per_cell,
+        mach_number,
+        density,
+        plate_x,
+        plate_height,
+        plate_width,
+        time_step,
+    } = Args::parse();
+    let region_temp = mean_velocity as f32 / mach_number;
+    // Compute number of molecules a particle represents
+    // Create simulation data structures
     loop {}
 }
