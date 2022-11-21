@@ -228,13 +228,13 @@ fn main() {
     let cell_vol: f64 = 2. / (number_of_cells) as f64;
     // Create simulation data structures
     let mut particles: &mut Vec<Particle> = &mut Vec::new();
-    let mut cell_data: Vec<CellSample> = Vec::with_capacity(number_of_cells);
+    let mut cell_data: &mut Vec<CellSample> = &mut Vec::with_capacity(number_of_cells);
     //go ahead and initialize the cell_data
     for i in 0..number_of_cells {
         cell_data.push(CellSample::new());
     }
 
-    let mut collision_data: Vec<CollisionInfo> = Vec::with_capacity(number_of_cells);
+    let mut collision_data: &mut Vec<CollisionInfo> = &mut Vec::with_capacity(number_of_cells);
     // Compute reasonable timestep
     let delta_x: f64 = 2. / (max(max(num_x, num_y), num_z)) as f64;
     let delta_t: f64 = 0.1 * delta_x / (mean_velocity + region_temp);
@@ -296,8 +296,8 @@ fn main() {
 
 fn collide_particles(
     particles: &[Particle],
-    collision_data: Vec<CollisionInfo>,
-    cell_data: Vec<CellSample>,
+    collision_data: &mut Vec<CollisionInfo>,
+    cell_data: &mut Vec<CellSample>,
     num_sample: i32,
     cell_vol: f64,
     delta_t: f64,
@@ -309,13 +309,20 @@ fn collide_particles(
 }
 
 // Initialize the sampled cell variables to zero
-fn initialize_sample(cell_data: Vec<CellSample>) {
+fn initialize_sample(cell_data: &mut Vec<CellSample>) {
     for sample in cell_data {
         sample.reset();
     }
 }
 
-fn sample_particles(cell_data: Vec<CellSample>, particles: &[Particle]) {}
+fn sample_particles(cell_data: &mut Vec<CellSample>, particles: &[Particle]) {
+    for particle in particles {
+        let sample = &mut cell_data[particle.parent_cell];
+        sample.number_of_particles += 1;
+        sample.total_velocity += particle.velocity;
+        sample.total_kinetic_energy += 0.5 * particle.velocity.magnitude_squared();
+    }
+}
 
 ///cell membership goes like this:
 /// 1. abs(x) starting from the origin,
