@@ -302,10 +302,14 @@ fn collide_particles(
     cell_vol: f64,
     delta_t: f64,
 ) {
+    let number_of_cells = cell_data.len();
     //1. Visit cells and determine chance that particles can collide
     //2. Sample particles for collision and perform collision
     //  collision is a random process where the result of
     //  a collision conserves momentum and kinetic energy
+    for i in 0..number_of_cells {
+        let n_mean = cell_data[i].number_of_particles as f64 / num_sample as f64;
+    }
 }
 
 // Initialize the sampled cell variables to zero
