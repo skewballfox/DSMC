@@ -9,5 +9,5 @@ edition = "2021"
 nalgebra = "0.31.3"
 ndarray={version="0.15.6",features=["rayon"]}
 num="0.4"
-rand="0.8.5"
+rand={version="0.8.5",features=["alloc"]}
 clap={version="4.0.26",features=["derive"]}

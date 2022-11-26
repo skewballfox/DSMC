@@ -5,7 +5,8 @@ extern crate nalgebra as na;
 use clap::{Arg, Parser};
 use na::coordinates::X;
 use num::{Bounded, Integer};
-use rand::thread_rng;
+use rand::prelude::*;
+use std::cell;
 use std::cmp::max;
 use std::f64::consts::PI;
 use std::fs::File;
@@ -13,7 +14,11 @@ use std::io::Write;
 use std::path::Path;
 
 const COLLISION_SIZE: f32 = 1e-28;
+//number of molecules each particle represents
+const molecules_per_particle: f64 = 1e27;
+const sigma_k: f64 = 1.000000003e-28;
 
+#[derive(PartialEq)]
 enum ParticleType {
     Inflow,
     Ricochet,
@@ -62,23 +67,26 @@ struct CollisionInfo {
 
 struct CellSample {
     number_of_particles: i32,
+    mean_particles: f64,
     total_velocity: na::Vector3<f64>,
     total_kinetic_energy: f64,
-    start: usize,
-    stop: usize,
+    members: Vec<usize>,
 }
 
 impl CellSample {
     fn new() -> Self {
         Self {
+            mean_particles: 0.,
             number_of_particles: 0,
             total_velocity: na::Vector3::zeros(),
             total_kinetic_energy: 0.0,
-            start: 0,
-            stop: 0,
+            //Note: balance of reads to writes is about even, so use mutex
+            //https://stackoverflow.com/questions/50704279/when-or-why-should-i-use-a-mutex-over-an-rwlock
+            members: Vec::new(),
         }
     }
     fn reset(&mut self) {
+        self.mean_particles = 0.;
         self.number_of_particles = 0;
         self.total_kinetic_energy = 0.;
         //https://stackoverflow.com/a/56114369/11019565
@@ -86,16 +94,6 @@ impl CellSample {
         self.total_velocity.y = 0.;
         self.total_velocity.z = 0.;
     }
-}
-
-pub struct Cell {
-    start: usize,
-    stop: usize,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct CellIndex {
-    index: [u32; 3],
 }
 
 // Initialize particles at inflow boundaries
@@ -221,8 +219,7 @@ fn main() {
     } = Args::parse();
     //temperature of the region, affects velocity #TODO: update description
     let region_temp: f64 = mean_velocity / mach_number;
-    //number of molecules each particle represents
-    let molecules_per_particle = 1e27;
+
     let number_of_cells = num_x * num_y * num_z;
     // Compute number of molecules a particle represents
     let cell_vol: f64 = 2. / (number_of_cells) as f64;
@@ -245,7 +242,7 @@ fn main() {
         time_step
     } / delta_t;
     let end_of_time: usize = 1 << ((time_step).log2().ceil()) as usize;
-
+    println!("end of time {:?}", end_of_time);
     let mut num_sample = 0;
     //
     let sample_reset = end_of_time / 4;
@@ -265,18 +262,18 @@ fn main() {
         // Move particles
         move_particles_with_bcs(&mut particles, plate_x, plate_height, plate_width, delta_t);
 
-        // Compute cell index for particles based on their current
-        // locations
-        index_particles(particles, num_x, num_y, num_z);
-        // Remove any particles that are now outside of boundaries
-        remove_outside_particles(particles, number_of_cells);
-
         num_sample += 1;
         // If time to reset cell samples, reinitialize data
         if n % sample_reset == 0 {
             initialize_sample(cell_data);
+            // Remove any particles that are now outside of boundaries
+            remove_outside_particles(particles, number_of_cells);
             num_sample = 0
         }
+
+        // Compute cell index for particles based on their current
+        // locations
+        index_particles(particles, cell_data, num_x, num_y, num_z);
 
         sample_particles(cell_data, particles);
         collide_particles(
@@ -292,10 +289,11 @@ fn main() {
     //----------------------------------------------------------------------------
 
     // Write out final particle data
+    write_particle_data(String::from("cells.dat"), particles);
 }
 
 fn collide_particles(
-    particles: &[Particle],
+    particles: &mut [Particle],
     collision_data: &mut Vec<CollisionInfo>,
     cell_data: &mut Vec<CellSample>,
     num_sample: i32,
@@ -304,11 +302,67 @@ fn collide_particles(
 ) {
     let number_of_cells = cell_data.len();
     //1. Visit cells and determine chance that particles can collide
-    //2. Sample particles for collision and perform collision
-    //  collision is a random process where the result of
-    //  a collision conserves momentum and kinetic energy
+
     for i in 0..number_of_cells {
-        let n_mean = cell_data[i].number_of_particles as f64 / num_sample as f64;
+        // Compute a number of particles that need to be selected for
+        // collision tests
+        let num_selections = (cell_data[i].number_of_particles as f64
+            + cell_data[i].mean_particles
+            + molecules_per_particle)
+            / (cell_vol + collision_data[i].collision_remainder);
+        let selection_count = num_selections as usize;
+        collision_data[i].collision_remainder = num_selections - selection_count as f64;
+        if selection_count > 0 {
+            if cell_data[i].number_of_particles < 2 {
+                collision_data[i].collision_remainder += num_selections;
+                continue;
+            }
+            // Select nselect particles for possible collision
+            let mut rng = &mut rand::thread_rng();
+            //2. Sample particles for collision and perform collision
+            //  collision is a random process where the result of
+            //  a collision conserves momentum and kinetic energy
+            for c in 0..selection_count {
+                // select two points in the cell
+                let cell_indices = rand::seq::index::sample(rng, cell_data[i].members.len(), 2);
+                let p1 = cell_data[c].members[*(&cell_indices.index(0))];
+                let p2 = cell_data[c].members[*(&cell_indices.index(1))];
+                //TODO: consider moving this to another thread which would actually collide the particles by index
+                //let mut particle_1 = particles[p1];
+                //let mut particle_2 = particles[p2];
+                let relative_velocity = particles[p1].velocity - particles[p2].velocity;
+                let relative_velocity_norm = relative_velocity.norm();
+                // Compute collision  rate for hard sphere model
+                let collision_rate = sigma_k * relative_velocity_norm;
+
+                let threshhold = if collision_rate > collision_data[c].max_collision_rate {
+                    //TODO: if different thread send update here
+                    collision_data[c].max_collision_rate = collision_rate;
+                    1.
+                } else {
+                    collision_rate / collision_data[i].max_collision_rate
+                };
+                let r: f64 = rng.gen();
+                if r < threshhold {
+                    // Collision Accepted, adjust particle velocities
+                    // Compute center of mass velocity, vcm
+                    let center_of_mass = 0.5 * (particles[p1].velocity + particles[p2].velocity);
+                    // Compute random perturbation that conserves momentum
+                    let pertubation = random_direction() * relative_velocity_norm;
+                    particles[p1].velocity = center_of_mass + 0.5 * pertubation;
+                    particles[p1].velocity = center_of_mass - 0.5 * pertubation;
+                    //seems wierd but I think this involves fewest comparisons
+                    if particles[p1].particle_type == ParticleType::Inflow
+                        && particles[p2].particle_type == ParticleType::Inflow
+                    {
+                        continue;
+                    } else {
+                        particles[p1].particle_type = ParticleType::Ricochet;
+                        particles[p2].particle_type = ParticleType::Ricochet;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -322,7 +376,7 @@ fn initialize_sample(cell_data: &mut Vec<CellSample>) {
 fn sample_particles(cell_data: &mut Vec<CellSample>, particles: &[Particle]) {
     for particle in particles {
         let sample = &mut cell_data[particle.parent_cell];
-        sample.number_of_particles += 1;
+        sample.mean_particles = sample.number_of_particles as f64 + sample.mean_particles / 2.;
         sample.total_velocity += particle.velocity;
         sample.total_kinetic_energy += 0.5 * particle.velocity.magnitude_squared();
     }
@@ -339,7 +393,13 @@ fn sample_particles(cell_data: &mut Vec<CellSample>, particles: &[Particle]) {
 /// 4 12 20    5 13 21
 /// 2 10 18    3 11 19
 /// 0 8  16    1 9  17
-fn index_particles(particles: &mut Vec<Particle>, num_x: usize, num_y: usize, num_z: usize) {
+fn index_particles(
+    particles: &mut Vec<Particle>,
+    cell_data: &mut Vec<CellSample>,
+    num_x: usize,
+    num_y: usize,
+    num_z: usize,
+) {
     let num_cells = num_x * num_y * num_z;
     //assuming number of cells must be even in the x direction
     let half_x = num_x / 2;
@@ -349,7 +409,7 @@ fn index_particles(particles: &mut Vec<Particle>, num_x: usize, num_y: usize, nu
     let dy: f64 = 2. / num_y as f64;
     let dz: f64 = 2. / num_y as f64;
 
-    for particle in particles {
+    for (i, particle) in particles.iter_mut().enumerate() {
         let y_offset = ((particle.position.y + 1.0 / dy).floor() as usize).min(num_y - 1) * 2;
         let z_offset =
             ((particle.position.z + 1.0 * dz).floor() as usize).min(num_z - 1) * (num_y * 2);
@@ -365,7 +425,10 @@ fn index_particles(particles: &mut Vec<Particle>, num_x: usize, num_y: usize, nu
             }
             _ => num_cells,
         };
-        particle.parent_cell = cell_membership
+        particle.parent_cell = cell_membership;
+        if cell_membership < num_cells {
+            cell_data[i].members.push(cell_membership);
+        }
     }
 }
 
@@ -404,11 +467,11 @@ struct Args {
     #[arg(long, long = "platedz", default_value_t = 0.5)]
     plate_width: f64,
     ///simulation time step size (usually computed from the above parameters)
-    #[arg(long, long = "nk", default_value_t = 0.)]
+    #[arg(long, long = "time", default_value_t = 0.)]
     time_step: f64, //not usize?
 }
 
-fn write_particle_data(file_name: String, particles: Vec<Particle>) -> std::io::Result<()> {
+fn write_particle_data(file_name: String, particles: &mut Vec<Particle>) -> std::io::Result<()> {
     let mut write_buf = Vec::new();
     let ptype_int: i32;
     for particle in particles {
