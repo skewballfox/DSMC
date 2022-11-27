@@ -6,12 +6,14 @@ use clap::{Arg, Parser};
 use na::coordinates::X;
 use num::{Bounded, Integer};
 use rand::prelude::*;
+use rand::seq::index;
 use std::cell;
 use std::cmp::max;
 use std::f64::consts::PI;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 const COLLISION_SIZE: f32 = 1e-28;
 //number of molecules each particle represents
@@ -57,12 +59,33 @@ fn random_velocity(region_temp: f64) -> f64 {
 }
 
 // Information that is used to control the collision probability code
-struct CollisionInfo {
+struct CollisionData {
     // Maximum collision rate seen for this cell so far in the simulation
-    max_collision_rate: f64,
+    max_collision_rate: Vec<f64>,
     // Non-integral fraction of collisions that remain to be performed
     // and are carried over into the next timestep
-    collision_remainder: f64,
+    remainder: Vec<f64>,
+}
+
+impl CollisionData {
+    fn new(num_cells: usize, region_temp: f64) -> Self {
+        Self {
+            max_collision_rate: vec![sigma_k * region_temp; num_cells],
+            remainder: vec![0.; num_cells],
+        }
+    }
+    //get the collision rate and remainder for a cell
+    fn get_data(&self, index: usize) -> (f64, f64) {
+        let collision_rate = self.max_collision_rate[index];
+
+        let remainder = self.remainder[index];
+        (collision_rate, remainder)
+    }
+
+    fn set_remainder(&mut self, index: usize, remainder: f64) {
+        //let mut remainders = self.max_collision_rate[index];
+        self.remainder[index] = remainder;
+    }
 }
 
 struct CellSample {
@@ -202,8 +225,11 @@ fn remove_outside_particles(particles: &mut Vec<Particle>, num_cells: usize) {
 fn main() {
     //-----------------------------INITIALIZATION-----------------------------
     //------------------------------------------------------------------------
+    //
+    let num_cores = std::thread::available_parallelism().unwrap();
     let mean_velocity: f64 = 1.; //switched to f32 to avoid repetitive casting
-                                 //struct destructuring for the win
+
+    //struct destructuring for the win
     let Args {
         two_dim,
         num_x,
@@ -217,6 +243,7 @@ fn main() {
         plate_width,
         time_step,
     } = Args::parse();
+
     //temperature of the region, affects velocity #TODO: update description
     let region_temp: f64 = mean_velocity / mach_number;
 
@@ -226,14 +253,16 @@ fn main() {
     // Create simulation data structures
     let mut particles: &mut Vec<Particle> = &mut Vec::new();
     let mut cell_data: &mut Vec<CellSample> = &mut Vec::with_capacity(number_of_cells);
+    println!("{:?}", number_of_cells);
     //go ahead and initialize the cell_data
     for i in 0..number_of_cells {
         cell_data.push(CellSample::new());
     }
 
-    let mut collision_data: &mut Vec<CollisionInfo> = &mut Vec::with_capacity(number_of_cells);
+    let mut collision_data: &mut CollisionData =
+        &mut CollisionData::new(number_of_cells, region_temp);
     // Compute reasonable timestep
-    let delta_x: f64 = 2. / (max(max(num_x, num_y), num_z)) as f64;
+    let delta_x: f64 = 2. / (max(max(num_x, num_y), num_z) as f64);
     let delta_t: f64 = 0.1 * delta_x / (mean_velocity + region_temp);
     // compute nearest power of 2 timesteps
     let end_of_time: f64 = if time_step < 0. {
@@ -241,7 +270,8 @@ fn main() {
     } else {
         time_step
     } / delta_t;
-    let end_of_time: usize = 1 << ((time_step).log2().ceil()) as usize;
+    let end_of_time: usize = 1 << (end_of_time.log2().ceil()) as usize;
+    println!("time step {:?}", time_step);
     println!("end of time {:?}", end_of_time);
     let mut num_sample = 0;
     //
@@ -285,16 +315,17 @@ fn main() {
             delta_t,
         )
     });
+    println!("finished");
     //-------------------------WRITE RESULTS--------------------------------------
     //----------------------------------------------------------------------------
 
     // Write out final particle data
-    write_particle_data(String::from("cells.dat"), particles);
+    write_particle_data(String::from("cells.dat"), particles).unwrap();
 }
 
 fn collide_particles(
     particles: &mut [Particle],
-    collision_data: &mut Vec<CollisionInfo>,
+    collision_data: &mut CollisionData,
     cell_data: &mut Vec<CellSample>,
     num_sample: i32,
     cell_vol: f64,
@@ -306,15 +337,17 @@ fn collide_particles(
     for i in 0..number_of_cells {
         // Compute a number of particles that need to be selected for
         // collision tests
+        let (mut current_max_rate, mut remainder) = collision_data.get_data(i);
         let num_selections = (cell_data[i].number_of_particles as f64
             + cell_data[i].mean_particles
             + molecules_per_particle)
-            / (cell_vol + collision_data[i].collision_remainder);
+            / (cell_vol + remainder);
         let selection_count = num_selections as usize;
-        collision_data[i].collision_remainder = num_selections - selection_count as f64;
+
+        remainder = num_selections - selection_count as f64;
         if selection_count > 0 {
             if cell_data[i].number_of_particles < 2 {
-                collision_data[i].collision_remainder += num_selections;
+                collision_data.set_remainder(i, remainder + num_selections);
                 continue;
             }
             // Select nselect particles for possible collision
@@ -327,20 +360,20 @@ fn collide_particles(
                 let cell_indices = rand::seq::index::sample(rng, cell_data[i].members.len(), 2);
                 let p1 = cell_data[c].members[*(&cell_indices.index(0))];
                 let p2 = cell_data[c].members[*(&cell_indices.index(1))];
+
                 //TODO: consider moving this to another thread which would actually collide the particles by index
-                //let mut particle_1 = particles[p1];
-                //let mut particle_2 = particles[p2];
+
                 let relative_velocity = particles[p1].velocity - particles[p2].velocity;
                 let relative_velocity_norm = relative_velocity.norm();
                 // Compute collision  rate for hard sphere model
                 let collision_rate = sigma_k * relative_velocity_norm;
 
-                let threshhold = if collision_rate > collision_data[c].max_collision_rate {
+                let threshhold = if collision_rate > current_max_rate {
                     //TODO: if different thread send update here
-                    collision_data[c].max_collision_rate = collision_rate;
+                    current_max_rate = collision_rate;
                     1.
                 } else {
-                    collision_rate / collision_data[i].max_collision_rate
+                    collision_rate / current_max_rate
                 };
                 let r: f64 = rng.gen();
                 if r < threshhold {
@@ -363,6 +396,7 @@ fn collide_particles(
                 }
             }
         }
+        collision_data.set_remainder(i, remainder);
     }
 }
 
@@ -375,10 +409,12 @@ fn initialize_sample(cell_data: &mut Vec<CellSample>) {
 
 fn sample_particles(cell_data: &mut Vec<CellSample>, particles: &[Particle]) {
     for particle in particles {
-        let sample = &mut cell_data[particle.parent_cell];
-        sample.mean_particles = sample.number_of_particles as f64 + sample.mean_particles / 2.;
-        sample.total_velocity += particle.velocity;
-        sample.total_kinetic_energy += 0.5 * particle.velocity.magnitude_squared();
+        if particle.parent_cell < cell_data.len() {
+            let sample = &mut cell_data[particle.parent_cell];
+            sample.mean_particles = sample.number_of_particles as f64 + sample.mean_particles / 2.;
+            sample.total_velocity += particle.velocity;
+            sample.total_kinetic_energy += 0.5 * particle.velocity.magnitude_squared();
+        }
     }
 }
 
@@ -427,7 +463,7 @@ fn index_particles(
         };
         particle.parent_cell = cell_membership;
         if cell_membership < num_cells {
-            cell_data[i].members.push(cell_membership);
+            cell_data[cell_membership].members.push(i);
         }
     }
 }
@@ -467,7 +503,7 @@ struct Args {
     #[arg(long, long = "platedz", default_value_t = 0.5)]
     plate_width: f64,
     ///simulation time step size (usually computed from the above parameters)
-    #[arg(long, long = "time", default_value_t = 0.)]
+    #[arg(long, long = "time", default_value_t = -1.)]
     time_step: f64, //not usize?
 }
 
