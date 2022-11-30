@@ -8,7 +8,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use nalgebra::Vector3;
 use rand::prelude::*;
 
-use crate::{random_direction, random_velocity, sigma_k, util::CollisionIndexReceiver};
+use crate::{random_direction, random_velocity, sigma_k, util::CollisionIndexReceiver, CellSample};
 
 #[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone)]
 pub(crate) enum ParticleType {
@@ -33,6 +33,16 @@ impl ParticleType {
 pub(crate) struct ParticlePointer(pub(crate) *mut Particle);
 unsafe impl Send for ParticlePointer {}
 unsafe impl Sync for ParticlePointer {}
+
+#[derive(Copy, Clone)]
+pub(crate) struct MaxPointer(pub(crate) *mut f64);
+unsafe impl Send for MaxPointer {}
+unsafe impl Sync for MaxPointer {}
+
+#[derive(Copy, Clone)]
+pub(crate) struct CellPointer(pub(crate) *mut CellSample);
+unsafe impl Send for CellPointer {}
+unsafe impl Sync for CellPointer {}
 
 // let indices = [1, 4, 7, 8];
 // let mut arr = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
