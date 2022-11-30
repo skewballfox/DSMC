@@ -5,9 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+
 [dependencies]
 nalgebra = "0.31.3"
 ndarray={version="0.15.6",features=["rayon"]}
 num="0.4"
 rand={version="0.8.5",features=["alloc"]}
 clap={version="4.0.26",features=["derive"]}
+thingbuf = "0.1.3"
+crossbeam = "0.8.2"
+rayon="1.6.0"
+atomic_float = "0.1.0"
