@@ -8,9 +8,9 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use nalgebra::Vector3;
 use rand::prelude::*;
 
-use crate::{random_direction, random_velocity, sigma_k, util::CollisionIndexReceiver, CellSample};
+use crate::{random_direction, random_velocity, util::CollisionIndexReceiver, CellSample, SIGMA_K};
 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone)]
+#[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone, Debug)]
 pub(crate) enum ParticleType {
     Inflow,
     Ricochet,
@@ -40,7 +40,7 @@ unsafe impl Send for MaxPointer {}
 unsafe impl Sync for MaxPointer {}
 
 #[derive(Copy, Clone)]
-pub(crate) struct CellPointer(pub(crate) *mut CellSample);
+pub(crate) struct CellPointer(pub(crate) *const CellSample);
 unsafe impl Send for CellPointer {}
 unsafe impl Sync for CellPointer {}
 
@@ -58,7 +58,7 @@ unsafe impl Sync for CellPointer {}
 //     *place = some_function(x);
 // });
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Particle {
     pub(crate) velocity: na::Vector3<f64>,
     pub(crate) position: na::Vector3<f64>,
