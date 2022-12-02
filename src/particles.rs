@@ -190,7 +190,6 @@ impl Particles {
             types: _,
             parent_cells: _,
             keepers: _,
-            plock: _,
         } = self;
         let particle_count = velocities.len();
 
@@ -249,7 +248,6 @@ impl Particles {
             types,
             parent_cells,
             keepers,
-            plock: _,
         } = self;
         let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
         //let mut keep=keepers.iter();
