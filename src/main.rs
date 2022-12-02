@@ -13,7 +13,7 @@ use crossbeam::channel::{self, unbounded, Receiver, Sender};
 
 //use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
-use particles::{CellPointer, MaxPointer, Particle, ParticlePointer, ParticleType};
+use particles::{Particle, ParticleType};
 use rand::prelude::*;
 
 use rayon::prelude::*;
@@ -262,7 +262,6 @@ impl CellSample {
 /// Create particles at inflow boundary
 /// This works by creating particles at a ghost cell just before the boundary
 /// any particles that don't make it into the domain are discarded.
-
 fn initialize_boundaries(
     particles: &mut Vec<Particle>,
     num_x: usize,
