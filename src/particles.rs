@@ -1,7 +1,7 @@
 use std::{
     fmt::{Display, Formatter},
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -35,12 +35,12 @@ unsafe impl Send for ParticlePointer {}
 unsafe impl Sync for ParticlePointer {}
 
 #[derive(Copy, Clone)]
-pub(crate) struct MaxPointer(pub(crate) *mut f64);
+pub(crate) struct MaxPointer(pub(crate) *mut AtomicU64);
 unsafe impl Send for MaxPointer {}
 unsafe impl Sync for MaxPointer {}
 
 #[derive(Copy, Clone)]
-pub(crate) struct CellPointer(pub(crate) *const CellSample);
+pub(crate) struct CellPointer(pub(crate) *mut CellSample);
 unsafe impl Send for CellPointer {}
 unsafe impl Sync for CellPointer {}
 

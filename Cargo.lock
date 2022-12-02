@@ -166,6 +166,7 @@ dependencies = [
  "nalgebra",
  "ndarray",
  "num",
+ "once_cell",
  "rand",
  "rayon",
  "thingbuf",
