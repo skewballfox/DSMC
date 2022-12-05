@@ -23,11 +23,12 @@ use rayon::prelude::*;
 use std::cmp::max;
 
 use std::fs::File;
+use std::hint;
 use std::io::Write;
 
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -206,38 +207,50 @@ fn main() {
         });
         println!("index/sample took {:?}", start.elapsed());
         //println!("particles {:?}", particles);
-        return;
+
         //println!("members {:?}", cell_data);
         println!("starting join collisions");
         let start = Instant::now();
-        rayon::scope(|s| {
-            let (collision_idx_sender, collision_idx_receiver) = unbounded();
-            rayon::join(
-                || {
-                    calc_collisions(
-                        &collision_idx_sender,
-                        &mut collision_remainder,
-                        &mut cell_data,
-                        molecules_per_particle,
-                        collision_max_rate.clone(),
-                        num_sample as i32,
-                        cell_vol,
-                        delta_t,
-                    );
-                    drop(collision_idx_sender)
-                },
-                || particles.collide(&collision_idx_receiver, collision_max_rate.clone()),
-            );
-        });
+        // rayon::scope(|s| {
+        //     let (collision_idx_sender, collision_idx_receiver) = unbounded();
+        //     rayon::join(
+        //         || {
+        //             calc_collisions(
+        //                 &collision_idx_sender,
+        //                 &mut collision_remainder,
+        //                 &mut cell_data,
+        //                 molecules_per_particle,
+        //                 collision_max_rate.clone(),
+        //                 num_sample as i32,
+        //                 cell_vol,
+        //                 delta_t,
+        //             );
+        //             drop(collision_idx_sender)
+        //         },
+        //         || particles.collide(&collision_idx_receiver, collision_max_rate.clone()),
+        //     );
+        // });
+        collide_particles(
+            &mut particles,
+            &mut collision_remainder,
+            &mut cell_data,
+            molecules_per_particle,
+            collision_max_rate.clone(),
+            num_sample as i32,
+            cell_vol,
+            delta_t,
+        );
         println!("collisions took {:?}", start.elapsed());
         println!("finished iter {:?}", n);
     });
     println!("finished");
+    let sample_data = EndSampleData::new(&cell_data, &particles);
     //-------------------------WRITE RESULTS--------------------------------------
     //----------------------------------------------------------------------------
 
     // Write out final particle data
-    write_particle_data(String::from("cells.dat"), particles).unwrap();
+    write_particle_data(String::from("particles.dat"), particles).unwrap();
+    write_sample_data(String::from("cells.dat"), sample_data).unwrap();
 }
 
 ///collection of data for cells, total kinetic energy and velocity have been removed
@@ -273,6 +286,33 @@ impl CellSample {
     }
 }
 
+struct EndSampleData {
+    total_velocity: Vec<na::Vector3<f64>>,
+    total_kinetic_energy: Vec<f64>,
+    particle_count: Vec<usize>,
+}
+
+impl EndSampleData {
+    fn new(cell_sample_data: &Vec<CellSample>, particles: &Particles) -> Self {
+        let mut total_velocity = Vec::with_capacity(cell_sample_data.len());
+        let mut total_kinetic_energy = Vec::with_capacity(cell_sample_data.len());
+        let mut particle_count = Vec::with_capacity(cell_sample_data.len());
+        for i in (0..cell_sample_data.len()) {
+            total_velocity[i] = na::Vector3::new(0., 0., 0.);
+            total_kinetic_energy[i] = 0.0;
+            particle_count[i] = cell_sample_data[i].members.len();
+            (0..cell_sample_data[i].members.len()).for_each(|k| {
+                total_velocity[i] += particles.velocities[k];
+                total_kinetic_energy[i] += 0.5 * particles.velocities[k].norm();
+            });
+        }
+        Self {
+            total_velocity,
+            total_kinetic_energy,
+            particle_count,
+        }
+    }
+}
 // Initialize particles at inflow boundaries
 /// Create particles at inflow boundary
 /// This works by creating particles at a ghost cell just before the boundary
@@ -380,8 +420,8 @@ fn remove_outside_particles(particles: &mut Vec<Particle>, num_cells: usize) {
 //a collision conserves momentum and kinetic energy
 // time-step is complete, continues
 
-fn calc_collisions(
-    collision_data_sender: &CollisionIndexSender,
+fn collide_particles(
+    particles: &mut Particles,
     collision_remainder: &mut Vec<f64>,
     cell_data: &mut Vec<CellSample>,
     molecules_per_particle: f64,
@@ -390,8 +430,23 @@ fn calc_collisions(
     cell_vol: f64,
     delta_t: f64,
 ) {
+    let mut cell: OnceCell<Vec<Arc<AtomicBool>>> = OnceCell::new();
+    {
+        cell.get_or_init(|| create_parking_lot(particles.len()));
+    }
+    let mut plock = cell.get_mut().unwrap();
+
+    grow_parking_lot(plock, particles.len());
+
     let number_of_cells = cell_data.len();
+    //for the calc collison part
     let cell_ptr = CellPointer(cell_data.as_mut_ptr());
+    //for the particles part
+    //let ce_ptr = ParentCellPointer(self.parent_cells.as_mut_ptr());
+    let velocity_ptr = VectorPointer(particles.velocities.as_mut_ptr());
+    let particle_type_ptr = ParticleTypePointer(particles.types.as_mut_ptr());
+    let plock_ptr = PlockPointer(unsafe { plock.as_ptr() });
+
     //1. Visit cells and determine chance that particles can collide
     println!("starting calc collisions");
     collision_remainder
@@ -444,15 +499,93 @@ fn calc_collisions(
                             let p2 = members[*(&cell_indices.index(1))];
                             (p1, p2)
                         })
-                        .chunks(8 * 16)
-                        .for_each(|chunk| collision_data_sender.send(chunk).unwrap());
+                        .chunks(8 * 128)
+                        .for_each(|chunk| {
+                            //println!("got collision indices: {:?}", chunk);
+                            //used first particle index to figure out what cell the particle belongs to
+                            let cell_idx = i;
+                            //use the cell index to get the current max
+                            //let current_max_atomic = unsafe { &*{ current_max_ptr }.0.add(*cell_idx) }; //collision_max_rate[*cell_idx].clone(); //
+                            let current_max = f64::from_bits(
+                                collision_max_rate
+                                    .get(&cell_idx)
+                                    .unwrap()
+                                    .load(Ordering::Relaxed),
+                            );
+                            chunk.into_par_iter().chunks(8).for_each(|lil_chunk| {
+                                lil_chunk.into_iter().for_each(|(p1, p2)| {
+                                    let mut rng = rand::thread_rng();
+                                    //println!("got collision indices: {:?}", collision_indices);
+                                    let lock1 = unsafe { &*{ plock_ptr }.0.add(p1) }.clone();
+                                    let lock2 = unsafe { &*{ plock_ptr }.0.add(p2) }.clone();
+
+                                    while !lock1.load(Ordering::Acquire)
+                                        || !lock2.load(Ordering::Acquire)
+                                    {
+                                        //println!("idling");
+                                        hint::spin_loop();
+                                    }
+                                    //println!("locking particles {:?}{:?}", p1, p2);
+                                    lock1.store(false, Ordering::Release);
+                                    lock2.store(false, Ordering::Release);
+                                    //println!("parked thread");
+                                    //get the pointers for setting the fields
+                                    let velocity1 = unsafe { &mut *{ velocity_ptr }.0.add(p1) };
+                                    let ptype1 = unsafe { &mut *{ particle_type_ptr }.0.add(p1) };
+                                    let velocity2 = unsafe { &mut *{ velocity_ptr }.0.add(p2) };
+                                    let ptype2 = unsafe { &mut *{ particle_type_ptr }.0.add(p2) };
+                                    //println!("got the data");
+                                    let relative_velocity = *velocity1 - *velocity2;
+                                    let relative_velocity_norm = relative_velocity.norm();
+                                    let collision_rate = (SIGMA_K * relative_velocity_norm);
+                                    let threshold = if current_max.lt(&collision_rate) {
+                                        1.
+                                    } else {
+                                        collision_rate / current_max
+                                    };
+                                    let r: f64 = rng.gen();
+                                    if r < threshold {
+                                        // Collision Accepted, adjust particle velocities
+                                        // Compute center of mass velocity, vcm
+                                        let center_of_mass = 0.5 * (*velocity1 + *velocity2);
+                                        // Compute random perturbation that conserves momentum
+                                        let perturbation =
+                                            random_direction(&mut rng) * relative_velocity_norm;
+                                        //make sure current particle isn't mutably accessed
+
+                                        // Adjust particle velocities to reflect collision
+                                        *velocity1 = center_of_mass + 0.5 * perturbation;
+                                        *velocity2 = center_of_mass - 0.5 * perturbation;
+
+                                        // Bookkeeping to track particle interactions
+                                        if *ptype1 != ParticleType::Inflow
+                                            || *ptype1 != ParticleType::Inflow
+                                        {
+                                            let maxtype = *ptype1.max(ptype2);
+                                            *ptype1 = maxtype;
+                                            *ptype2 = maxtype;
+                                        }
+                                    }
+                                    if current_max.lt(&collision_rate) {
+                                        collision_max_rate
+                                            .get(&cell_idx)
+                                            .unwrap()
+                                            .store(collision_rate.to_bits(), Ordering::Relaxed);
+                                    }
+                                    lock1.store(true, Ordering::Release);
+                                    lock2.store(true, Ordering::Release);
+                                    //println!("released locks")
+                                    //});
+                                });
+                            })
+                        });
 
                     //collision_data.max_collision_rate[i] =
                     //collide(current_max_rate, collision_indices, particles, rng);
                 }
             }
         });
-    println!("end_reached");
+    //println!("end_reached");
 }
 
 // fn collide_particles(
@@ -574,6 +707,27 @@ fn write_particle_data(file_name: String, particles: Particles) -> std::io::Resu
 
     write!(write_buf, "{}", particles).unwrap();
 
+    let file_path = Path::new(&file_name);
+    let mut particle_file = File::create(file_name).unwrap();
+    particle_file.write(&write_buf).unwrap();
+    Ok(())
+}
+
+fn write_sample_data(file_name: String, sample_data: EndSampleData) -> std::io::Result<()> {
+    let mut write_buf = Vec::new();
+    let ptype_int: i32;
+    for i in (0..sample_data.total_velocity.len()) {
+        write!(
+            write_buf,
+            "{} {} {} {} {}",
+            sample_data.particle_count[i],
+            sample_data.total_velocity[i].x,
+            sample_data.total_velocity[i].y,
+            sample_data.total_velocity[i].z,
+            sample_data.total_kinetic_energy[i]
+        )
+        .unwrap()
+    }
     let file_path = Path::new(&file_name);
     let mut particle_file = File::create(file_name).unwrap();
     particle_file.write(&write_buf).unwrap();
