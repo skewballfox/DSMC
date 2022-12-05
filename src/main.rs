@@ -147,8 +147,11 @@ fn main() {
     //---------------------------HOT LOOP ----------------------------------------
     //----------------------------------------------------------------------------
     (0..run_time).for_each(|n| {
-        println!("initializaing boundaries");
-
+        println!(
+            "initializaing boundaries, paricle count: {}",
+            particles.len()
+        );
+        let start = Instant::now();
         // Add particles at inflow boundaries
         rayon::join(
             || {
@@ -163,7 +166,11 @@ fn main() {
             },
             || clear_cell_members(&mut cell_data),
         );
-
+        println!(
+            "initialization took {:?}, paricle count: {}",
+            start.elapsed(),
+            particles.len()
+        );
         // Move particles
         println!("updating positions");
         let start = Instant::now();
@@ -172,10 +179,13 @@ fn main() {
         println!("update took {:?}", start.elapsed());
         num_sample += 1;
         // If time to reset cell samples, reinitialize data
-        if n % sample_reset == 0 {
+        if num_sample % sample_reset == 0 {
             initialize_sample(&mut cell_data);
+            println!("filtering particles");
+            let start = Instant::now();
             // Remove any particles that are now outside of boundaries
             particles.filter_out_of_scope(number_of_cells);
+            println!("filter took: {:?}", start.elapsed());
             num_sample = 0
         }
         println!("starting join index/sample");
@@ -196,7 +206,7 @@ fn main() {
         });
         println!("index/sample took {:?}", start.elapsed());
         //println!("particles {:?}", particles);
-
+        return;
         //println!("members {:?}", cell_data);
         println!("starting join collisions");
         let start = Instant::now();
@@ -210,7 +220,7 @@ fn main() {
                         &mut cell_data,
                         molecules_per_particle,
                         collision_max_rate.clone(),
-                        num_sample,
+                        num_sample as i32,
                         cell_vol,
                         delta_t,
                     );
@@ -539,15 +549,15 @@ fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdate
     sample_reciever.into_iter().for_each(|chunk| {
         //chunk.into_par_iter().chunks(4).for_each(|chunk| {
         chunk.into_iter().for_each(|(cell_idx, particle_idx)| {
-            println!("receiving {:?}", cell_idx);
+            //println!("receiving {:?}", cell_idx);
             if cell_idx < num_cells {
                 // let cell = unsafe { &*{ cell_ptr }.0.add(cell_idx) };
                 // let guard = Arc::clone(&cell.members);
 
                 // let mut members = guard.lock().unwrap();
-                if cell_data[cell_idx].members.len() != 0 {
-                    println!("yup")
-                }
+                // if cell_data[cell_idx].members.len() != 0 {
+                //     println!("yup")
+                // }
                 // members.push(particle_idx);
                 cell_data[cell_idx].members.push(particle_idx)
                 //println!("members {:?}", members);

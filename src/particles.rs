@@ -266,7 +266,7 @@ impl Particles {
                                 *y + rng.gen::<f64>(),
                                 *z + rng.gen::<f64>(),
                             );
-                            println!("{}", position);
+                            //println!("{}", position);
                             let mut velocity =
                                 random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
                             velocity.x += mean_velocity;
