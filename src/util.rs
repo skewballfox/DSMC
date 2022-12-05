@@ -1,5 +1,6 @@
 use std::{
     f64::consts::PI,
+    ops::DerefMut,
     sync::{
         atomic::{AtomicBool, AtomicU64},
         Arc,
@@ -77,9 +78,9 @@ unsafe impl Send for BoolPointer {}
 unsafe impl Sync for BoolPointer {}
 
 #[derive(Copy, Clone)]
-pub(crate) struct AtomicBoolPointer(pub(crate) *mut AtomicBool);
-unsafe impl Send for AtomicBoolPointer {}
-unsafe impl Sync for AtomicBoolPointer {}
+pub(crate) struct PlockPointer(pub(crate) *const Arc<AtomicBool>);
+unsafe impl Send for PlockPointer {}
+unsafe impl Sync for PlockPointer {}
 // let indices = [1, 4, 7, 8];
 // let mut arr = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 // let arr_ptr = Pointer(arr.as_mut_ptr());
@@ -94,21 +95,38 @@ unsafe impl Sync for AtomicBoolPointer {}
 //     *place = some_function(x);
 // });
 
-pub(crate) fn gen_outer_range(num_y: usize, num_z: usize) -> Vec<(usize, usize)> {
-    let mut outer_range = Vec::with_capacity(num_y * num_z);
-    outer_range.par_extend(
-        (0..num_y)
-            .into_par_iter()
-            .flat_map(|i| -> Vec<(usize, usize)> {
-                let mut tmp = vec![(0, 0); num_z];
-                (0..num_z)
-                    .into_par_iter()
-                    .map(|j| -> (usize, usize) { (i, j) })
-                    .collect_into_vec(&mut tmp);
-                tmp
-            }),
-    );
-    outer_range
+pub(crate) fn gen_outer_range(
+    num_x: usize,
+    num_y: usize,
+    num_z: usize,
+    mppc: usize,
+) -> Vec<(f64, f64, f64)> {
+    let dx = 2. / (num_x as f64);
+    let dy = 2. / (num_y as f64);
+    let dz = 2. / (num_z as f64);
+    //let mut outer_range = Vec::with_capacity(num_y * num_z * mppc);
+
+    (0..num_y)
+        .into_par_iter()
+        .map(|i| -> Vec<(f64, f64, f64)> {
+            (0..num_z)
+                .into_par_iter()
+                .map(|j| -> Vec<(f64, f64, f64)> {
+                    (0..mppc)
+                        .into_par_iter()
+                        .map(|k| -> (f64, f64, f64) {
+                            let current_x = (-1. - dx) * dx;
+                            let current_y = (-1. + i as f64 * dy) * dy;
+                            let current_z = (-1. + j as f64 * dz) * dz;
+                            (current_x, current_y, current_z)
+                        })
+                        .collect()
+                })
+                .flatten()
+                .collect()
+        })
+        .flatten()
+        .collect::<Vec<(f64, f64, f64)>>()
 }
 
 ///Ironically enough, I defined this to make my code more legible, takes a pointer to the particle array,
@@ -130,17 +148,16 @@ use crate::{
     CellSample,
 };
 
-pub(crate) fn create_parking_lot(lot_size: usize) -> Vec<Arc<Parker>> {
-    let parking_lot: Vec<Arc<Parker>> = Vec::with_capacity(lot_size);
+pub(crate) fn create_parking_lot(lot_size: usize) -> Vec<Arc<AtomicBool>> {
+    let mut parking_lot: Vec<Arc<AtomicBool>> = Vec::with_capacity(lot_size);
     for i in 0..lot_size {
-        parking_lot.push(Arc::new(Parker::new()))
+        parking_lot.push(Arc::new(AtomicBool::new(true)))
     }
     return parking_lot;
 }
 
-pub(crate) fn grow_parking_lot(parking_lot: &mut Vec<Arc<Parker>>, lot_size: usize) {
-    let parking_lot: Vec<Arc<Parker>> = Vec::with_capacity(lot_size);
+pub(crate) fn grow_parking_lot(parking_lot: &mut Vec<Arc<AtomicBool>>, lot_size: usize) {
     for i in parking_lot.len() - 1..lot_size {
-        parking_lot.push(Arc::new(Parker::new()))
+        parking_lot.push(Arc::new(AtomicBool::new(true)))
     }
 }

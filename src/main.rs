@@ -11,8 +11,10 @@ use crate::util::*;
 use clap::Parser;
 use crossbeam::channel::{self, unbounded, Receiver, Sender};
 
+use dashmap::DashMap;
 //use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
+use particles::Particles;
 use particles::{Particle, ParticleType};
 use rand::prelude::*;
 
@@ -99,21 +101,27 @@ fn main() {
     let region_temp: f64 = mean_velocity / mach_number;
 
     let number_of_cells = num_x * num_y * num_z;
+    let dx = 2. / num_x as f64;
+    let dy = 2. / num_y as f64;
+    let dz = 2. / num_z as f64;
     // Compute number of molecules a particle represents
     let cell_vol: f64 = 2. / (number_of_cells) as f64;
+    //let cell_vol: f64 = dx * dy * dz;
     let molecules_per_particle = density * cell_vol / (mean_particles_per_cell as f64);
     //create channels to share between threads
 
     // Create simulation data structures
     //let mut particles: Particles = Particles::new(collision_idx_receiver, sample_data_sender);
-    let mut particles: Vec<Particle> = Vec::new();
+    let mut particles: Particles = Particles::new();
     let mut cell_data: Vec<CellSample> = Vec::with_capacity(number_of_cells);
     println!("{:?}", number_of_cells);
     let mut collision_remainder: Vec<f64> = Vec::with_capacity(number_of_cells);
-    let mut collision_max_rate: Vec<AtomicU64> = Vec::with_capacity(number_of_cells);
+    let mut collision_max_rate: Arc<DashMap<usize, AtomicU64>> =
+        Arc::new(DashMap::with_capacity(number_of_cells));
+
     //go ahead and initialize the cell_data
-    for _ in 0..number_of_cells {
-        collision_max_rate.push(AtomicU64::new((SIGMA_K * region_temp).to_bits()));
+    for i in 0..number_of_cells {
+        collision_max_rate.insert(i, AtomicU64::new((SIGMA_K * region_temp).to_bits()));
         collision_remainder.push(rand::random::<f64>());
         cell_data.push(CellSample::new());
     }
@@ -140,35 +148,34 @@ fn main() {
     //----------------------------------------------------------------------------
     (0..run_time).for_each(|n| {
         println!("initializaing boundaries");
-        rayon::scope(|s| {
-            // Add particles at inflow boundaries
-            rayon::join(
-                || {
-                    initialize_boundaries(
-                        &mut particles,
-                        num_x,
-                        num_y,
-                        num_z,
-                        mean_velocity,
-                        region_temp,
-                        mean_particles_per_cell,
-                    )
-                },
-                || clear_cell_members(&mut cell_data),
-            );
-        });
+
+        // Add particles at inflow boundaries
+        rayon::join(
+            || {
+                particles.initialize_boundaries(
+                    num_x,
+                    num_y,
+                    num_z,
+                    mean_velocity,
+                    region_temp,
+                    mean_particles_per_cell,
+                )
+            },
+            || clear_cell_members(&mut cell_data),
+        );
+
         // Move particles
         println!("updating positions");
         let start = Instant::now();
         //particles.update_positions();
-        move_particles_with_bcs(&mut particles, plate_x, plate_height, plate_width, delta_t);
+        particles.update_positions(plate_x, plate_height, plate_width, delta_t);
         println!("update took {:?}", start.elapsed());
         num_sample += 1;
         // If time to reset cell samples, reinitialize data
         if n % sample_reset == 0 {
             initialize_sample(&mut cell_data);
             // Remove any particles that are now outside of boundaries
-            remove_outside_particles(&mut particles, number_of_cells);
+            particles.filter_out_of_scope(number_of_cells);
             num_sample = 0
         }
         println!("starting join index/sample");
@@ -176,17 +183,20 @@ fn main() {
         // Compute cell index for particles based on their current
         // locations
         //NOTE: these task should
+
         rayon::scope(|s| {
             let (sample_sender, sample_receiver) = unbounded();
             rayon::join(
                 || {
-                    index_particles(&mut particles, &sample_sender, num_x, num_y, num_z);
+                    particles.index(&sample_sender, num_x, num_y, num_z);
                     drop(sample_sender)
                 },
                 || update_sample(&mut cell_data, &sample_receiver.clone()),
             )
         });
         println!("index/sample took {:?}", start.elapsed());
+        //println!("particles {:?}", particles);
+
         //println!("members {:?}", cell_data);
         println!("starting join collisions");
         let start = Instant::now();
@@ -199,19 +209,14 @@ fn main() {
                         &mut collision_remainder,
                         &mut cell_data,
                         molecules_per_particle,
+                        collision_max_rate.clone(),
                         num_sample,
                         cell_vol,
                         delta_t,
                     );
                     drop(collision_idx_sender)
                 },
-                || {
-                    collide_particles(
-                        &collision_idx_receiver,
-                        &mut particles,
-                        &mut collision_max_rate,
-                    )
-                },
+                || particles.collide(&collision_idx_receiver, collision_max_rate.clone()),
             );
         });
         println!("collisions took {:?}", start.elapsed());
@@ -262,57 +267,57 @@ impl CellSample {
 /// Create particles at inflow boundary
 /// This works by creating particles at a ghost cell just before the boundary
 /// any particles that don't make it into the domain are discarded.
-fn initialize_boundaries(
-    particles: &mut Vec<Particle>,
-    num_x: usize,
-    num_y: usize,
-    num_z: usize,
-    mean_velocity: f64,
-    region_temp: f64,
-    mean_particles_per_cell: usize,
-) {
-    // TODO: I might be able to avoid resizing the particle containing
-    // data structure by running the functions
-    // move_particles and remove_outside_particles (or similar function)
-    //directly on the generated particles
-    let dx = 2. / (num_x as f64);
-    let dy = 2. / (num_y as f64);
-    let dz = 2. / (num_z as f64);
-    let cell: OnceCell<Vec<(usize, usize)>> = OnceCell::new();
-    let outer_range = cell.get_or_init(|| gen_outer_range(num_y, num_z));
-    //let tmp=Vec<Particle> = Vec::new()
-    particles.par_extend(
-        outer_range
-            .into_par_iter()
-            .flat_map(|(j, k)| -> Vec<Particle> {
-                let current_x = -1. - dx;
-                let current_y = -1. + *j as f64 * dy;
-                let current_z = -1. + *k as f64 * dz;
-                println!("d {} {} {}", dx, dy, dz);
-                println!("curr {} {} {}", current_x, current_y, current_z);
-                (0..mean_particles_per_cell)
-                    .into_par_iter()
-                    //.chunks(CHONKY)
-                    .map(|_| -> Particle {
-                        let mut rng = rand::thread_rng();
-                        let position = na::Vector3::<f64>::new(
-                            current_x + rng.gen::<f64>() * dx,
-                            current_y + rng.gen::<f64>() * dy,
-                            current_z + rng.gen::<f64>() * dz,
-                        );
-                        println!("{}", position);
-                        let mut velocity =
-                            random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
-                        velocity.x += mean_velocity;
-                        Particle::new(position, velocity)
-                    })
-                    .collect()
-            })
-            //.filter(|p| (-1.0..=1.0).contains(&p.velocity.x))W
-            .collect::<Vec<Particle>>(),
-    );
-    println!("particle count: {:?}", particles.len());
-}
+// fn initialize_boundaries(
+//     particles: &mut Vec<Particle>,
+//     num_x: usize,
+//     num_y: usize,
+//     num_z: usize,
+//     mean_velocity: f64,
+//     region_temp: f64,
+//     mean_particles_per_cell: usize,
+// ) {
+//     // TODO: I might be able to avoid resizing the particle containing
+//     // data structure by running the functions
+//     // move_particles and remove_outside_particles (or similar function)
+//     //directly on the generated particles
+//     let dx = 2. / (num_x as f64);
+//     let dy = 2. / (num_y as f64);
+//     let dz = 2. / (num_z as f64);
+//     let cell: OnceCell<Vec<(usize, usize)>> = OnceCell::new();
+//     let outer_range = cell.get_or_init(|| gen_outer_range(num_y, num_z));
+//     //let tmp=Vec<Particle> = Vec::new()
+//     particles.par_extend(
+//         outer_range
+//             .into_par_iter()
+//             .flat_map(|(j, k)| -> Vec<Particle> {
+//                 let current_x = -1. - dx;
+//                 let current_y = -1. + *j as f64 * dy;
+//                 let current_z = -1. + *k as f64 * dz;
+//                 println!("d {} {} {}", dx, dy, dz);
+//                 println!("curr {} {} {}", current_x, current_y, current_z);
+//                 (0..mean_particles_per_cell)
+//                     .into_par_iter()
+//                     //.chunks(CHONKY)
+//                     .map(|_| -> Particle {
+//                         let mut rng = rand::thread_rng();
+//                         let position = na::Vector3::<f64>::new(
+//                             current_x + rng.gen::<f64>() * dx,
+//                             current_y + rng.gen::<f64>() * dy,
+//                             current_z + rng.gen::<f64>() * dz,
+//                         );
+//                         println!("{}", position);
+//                         let mut velocity =
+//                             random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
+//                         velocity.x += mean_velocity;
+//                         Particle::new(position, velocity)
+//                     })
+//                     .collect()
+//             })
+//             //.filter(|p| (-1.0..=1.0).contains(&p.velocity.x))W
+//             .collect::<Vec<Particle>>(),
+//     );
+//     println!("particle count: {:?}", particles.len());
+// }
 
 /// Move particle for the timestep.  
 ///Also handle side periodic boundary conditions
@@ -370,28 +375,45 @@ fn calc_collisions(
     collision_remainder: &mut Vec<f64>,
     cell_data: &mut Vec<CellSample>,
     molecules_per_particle: f64,
+    collision_max_rate: Arc<DashMap<usize, AtomicU64>>,
     num_sample: i32,
     cell_vol: f64,
     delta_t: f64,
 ) {
     let number_of_cells = cell_data.len();
+    let cell_ptr = CellPointer(cell_data.as_mut_ptr());
     //1. Visit cells and determine chance that particles can collide
     println!("starting calc collisions");
     collision_remainder
         .into_par_iter()
         .enumerate()
-        .for_each(|(i, remainder)| {
+        .for_each(move |(i, remainder)| {
             // Compute a number of particles that need to be selected for
             // collision tests
 
             //let members = cell_data[i].members.lock().unwrap();
+            let cell = unsafe { &mut *{ cell_ptr }.0.add(i) };
+            let member_count = cell.members.len();
+            let current_max =
+                f64::from_bits(collision_max_rate.get(&i).unwrap().load(Ordering::Relaxed));
+            cell.mean_particles = (cell.mean_particles + current_max + member_count as f64) / 2.;
             let members = &cell_data[i].members;
 
             let num_selections =
-                (members.len() as f64 + cell_data[i].mean_particles + molecules_per_particle)
-                    / (cell_vol + *remainder);
-            let selection_count = num_selections as usize;
-            println!("selection count {:?}", selection_count);
+                (member_count as f64 * cell.mean_particles * molecules_per_particle * delta_t
+                    / cell_vol)
+                    + *remainder;
+
+            let selection_count = num_selections.floor() as usize;
+            if member_count > 0 {
+                println!("selection count {:?}", selection_count);
+                println!("num selections {:?}", num_selections);
+                println!("member_count {:?}", member_count);
+                println!("mean particlses {:?}", cell.mean_particles);
+                println!("delta_t {:?}", delta_t);
+                println!("cell vol: {:?}", cell_vol);
+                println!("current max {:?}", current_max);
+            }
             *remainder = num_selections - selection_count as f64;
             if selection_count > 0 {
                 if members.len() < 2 {
@@ -412,7 +434,7 @@ fn calc_collisions(
                             let p2 = members[*(&cell_indices.index(1))];
                             (p1, p2)
                         })
-                        .chunks(8)
+                        .chunks(8 * 16)
                         .for_each(|chunk| collision_data_sender.send(chunk).unwrap());
 
                     //collision_data.max_collision_rate[i] =
@@ -423,60 +445,27 @@ fn calc_collisions(
     println!("end_reached");
 }
 
-fn collide_particles(
-    collision_index_receiver: &CollisionIndexReceiver,
-    particles: &mut [Particle],
-    collision_max_rate: &mut [AtomicU64],
-) {
-    let particle_arr = ParticlePointer(particles.as_mut_ptr());
-    let current_max_pointer = MaxPointer(collision_max_rate.as_mut_ptr());
-    let num_cells = collision_max_rate.len();
-    collision_index_receiver
-        .into_iter()
-        .for_each(|collision_indices| {
-            //println!("got collision indices: {:?}", collision_indices);
+// fn collide_particles(
+//     collision_index_receiver: &CollisionIndexReceiver,
+//     particles: &mut Particles,
+//     collision_max_rate: &mut [AtomicU64],
+// ) {
+//     let current_max_pointer = MaxPointer(collision_max_rate.as_mut_ptr());
 
-            let current_max_atomic = get_max!(collision_indices, particle_arr, current_max_pointer);
-            let current_max = f64::from_bits(current_max_atomic.load(Ordering::Relaxed));
-            collision_indices.into_par_iter().for_each(move |(p1, p2)| {
-                let mut rng = rand::thread_rng();
-                let particle_1 = unsafe { &mut *{ particle_arr }.0.add(p1) };
-                let particle_2 = unsafe { &mut *{ particle_arr }.0.add(p2) };
-                //let cell_index = particle_1.parent_cell;
-                let relative_velocity = particle_1.velocity - particle_2.velocity;
-                let relative_velocity_norm = relative_velocity.norm();
-                let collision_rate: &mut f64 = &mut (SIGMA_K * relative_velocity_norm);
-                let threshold = if current_max.lt(&collision_rate) {
-                    1.
-                } else {
-                    *collision_rate / current_max
-                };
-                let r: f64 = rng.gen();
-                if r < threshold {
-                    // Collision Accepted, adjust particle velocities
-                    // Compute center of mass velocity, vcm
-                    let center_of_mass = 0.5 * (particle_1.velocity + particle_2.velocity);
-                    // Compute random perturbation that conserves momentum
-                    let perturbation = random_direction(&mut rng) * relative_velocity_norm;
-                    particle_1.velocity = center_of_mass + 0.5 * perturbation;
-                    particle_1.velocity = center_of_mass - 0.5 * perturbation;
-
-                    if particle_1.particle_type != ParticleType::Inflow
-                        || particle_2.particle_type != ParticleType::Inflow
-                    {
-                        let maxtype = particle_1.particle_type.max(particle_2.particle_type);
-                        particle_1.particle_type =
-                            particle_1.particle_type.max(particle_1.particle_type);
-                        particle_2.particle_type =
-                            particle_2.particle_type.max(particle_2.particle_type);
-                    }
-                }
-                if current_max.lt(&collision_rate) {
-                    current_max_atomic.store(collision_rate.to_bits(), Ordering::Relaxed)
-                }
-            });
-        });
-}
+//     let num_cells = collision_max_rate.len();
+//     collision_index_receiver
+//         .into_iter()
+//         .for_each(|collision_indices| {
+//             //println!("got collision indices: {:?}", collision_indices);
+//             //let cell_idx = ce
+//             //let current_max_atomic = get_max!(collision_indices, particle_arr, current_max_pointer);
+//             let current_max = f64::from_bits(current_max_atomic.load(Ordering::Relaxed));
+//             collision_indices.into_par_iter().for_each(move |(p1, p2)| {
+//                 let mut rng = rand::thread_rng();
+//                 particles.collide(p1, p2, current_max, &mut rng);
+//             });
+//         });
+// }
 
 // Initialize the sampled cell variables to zero
 fn initialize_sample(cell_data: &mut Vec<CellSample>) {
@@ -496,53 +485,53 @@ fn initialize_sample(cell_data: &mut Vec<CellSample>) {
 /// 4 12 20    5 13 21
 /// 2 10 18    3 11 19
 /// 0 8  16    1 9  17
-fn index_particles(
-    particles: &mut [Particle],
-    sample_sender: &SampleUpdateSender,
-    num_x: usize,
-    num_y: usize,
-    num_z: usize,
-) {
-    let num_cells = num_x * num_y * num_z;
-    //assuming number of cells must be even in the x direction
-    let half_x = num_x / 2;
-    let grid_size = num_y * num_z;
-    let z_mult = num_y * 2;
+// fn index_particles(
+//     particles: &mut [Particle],
+//     sample_sender: &SampleUpdateSender,
+//     num_x: usize,
+//     num_y: usize,
+//     num_z: usize,
+// ) {
+//     let num_cells = num_x * num_y * num_z;
+//     //assuming number of cells must be even in the x direction
+//     let half_x = num_x / 2;
+//     let grid_size = num_y * num_z;
+//     let z_mult = num_y * 2;
 
-    let dy: f64 = 2. / num_y as f64;
-    let dz: f64 = 2. / num_y as f64;
+//     let dy: f64 = 2. / num_y as f64;
+//     let dz: f64 = 2. / num_y as f64;
 
-    println!("indexing particles start");
-    particles
-        .into_par_iter()
-        .enumerate()
-        .map(|(i, particle)| {
-            let y_offset = ((particle.position.y + 1.0 / dy).floor() as usize).min(num_y - 1) * 2;
-            let z_offset =
-                ((particle.position.z + 1.0 * dz).floor() as usize).min(num_z - 1) * (num_y * 2);
-            //figure out where a particle belongs based of it's location along the x-axis
-            let cell_membership: usize = match particle.position {
-                //scenario one: it's left of 0 or 0
-                p if (-1.0..=0.0).contains(&p.x) => {
-                    let x_offset = (((p.x).abs() * half_x as f64).floor() as usize).min(half_x);
-                    x_offset + y_offset + z_offset
-                }
-                //scenario two: it's right of zero or one
-                p if (0.0..=1.).contains(&p.x) => {
-                    let x_offset = (((p.x).abs() * half_x as f64).floor() as usize).min(half_x);
-                    x_offset + y_offset + z_offset + 1
-                }
-                //scenario three: it's no longer relevant
-                _ => num_cells,
-            };
-            //println!("send it");
-            particle.parent_cell = cell_membership;
-            (cell_membership, i)
-        })
-        .chunks(8)
-        .for_each(|chunk| sample_sender.send(chunk).unwrap());
-    //sample_sender.send((num_cells, num_cells)).unwrap();
-}
+//     println!("indexing particles start");
+//     particles
+//         .into_par_iter()
+//         .enumerate()
+//         .map(|(i, particle)| {
+//             let y_offset = ((particle.position.y + 1.0 / dy).floor() as usize).min(num_y - 1) * 2;
+//             let z_offset =
+//                 ((particle.position.z + 1.0 * dz).floor() as usize).min(num_z - 1) * (num_y * 2);
+//             //figure out where a particle belongs based of it's location along the x-axis
+//             let cell_membership: usize = match particle.position {
+//                 //scenario one: it's left of 0 or 0
+//                 p if (-1.0..=0.0).contains(&p.x) => {
+//                     let x_offset = (((p.x).abs() * half_x as f64).floor() as usize).min(half_x);
+//                     x_offset + y_offset + z_offset
+//                 }
+//                 //scenario two: it's right of zero or one
+//                 p if (0.0..=1.).contains(&p.x) => {
+//                     let x_offset = (((p.x).abs() * half_x as f64).floor() as usize).min(half_x);
+//                     x_offset + y_offset + z_offset + 1
+//                 }
+//                 //scenario three: it's no longer relevant
+//                 _ => num_cells,
+//             };
+//             //println!("send it");
+//             particle.parent_cell = cell_membership;
+//             (cell_membership, i)
+//         })
+//         .chunks(8)
+//         .for_each(|chunk| sample_sender.send(chunk).unwrap());
+//     //sample_sender.send((num_cells, num_cells)).unwrap();
+// }
 
 fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdateReceiver) {
     let cell_ptr = CellPointer(cell_data.as_mut_ptr());
@@ -569,12 +558,12 @@ fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdate
     });
 }
 
-fn write_particle_data(file_name: String, particles: Vec<Particle>) -> std::io::Result<()> {
+fn write_particle_data(file_name: String, particles: Particles) -> std::io::Result<()> {
     let mut write_buf = Vec::new();
     let ptype_int: i32;
-    for particle in particles {
-        write!(write_buf, "{}\n", particle).unwrap()
-    }
+
+    write!(write_buf, "{}", particles).unwrap();
+
     let file_path = Path::new(&file_name);
     let mut particle_file = File::create(file_name).unwrap();
     particle_file.write(&write_buf).unwrap();

@@ -1,8 +1,9 @@
 use std::{
     fmt::{Display, Formatter},
+    hint,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -11,8 +12,8 @@ use crate::{
     random_direction, random_velocity,
     util::{
         create_parking_lot, gen_outer_range, grow_parking_lot, BoolPointer, CollisionIndexReceiver,
-        ImmutableParentCellPointer, ParentCellPointer, ParticleTypePointer, SampleUpdateSender,
-        VectorPointer,
+        ImmutableParentCellPointer, MaxPointer, ParentCellPointer, ParticleTypePointer,
+        PlockPointer, SampleUpdateSender, VectorPointer,
     },
     CellSample, SIGMA_K,
 };
@@ -20,13 +21,16 @@ use crossbeam::{
     channel::{unbounded, Receiver, Sender},
     sync::Parker,
 };
+use dashmap::DashMap;
+use na::default_allocator;
 use nalgebra::{Matrix, Vector3};
 use once_cell::sync::OnceCell;
 use rand::prelude::*;
 use rayon::prelude::*;
 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone, Debug)]
-pub(crate) enum ParticleType {
+#[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ParticleType {
+    #[default]
     Inflow,
     Ricochet,
     Thud,
@@ -74,12 +78,13 @@ impl Particle {
     }
 }
 
+#[derive(Debug)]
 pub struct Particles {
     //receiver: ThingBuf,
-    velocities: Vec<na::Vector3<f64>>,
-    positions: Vec<na::Vector3<f64>>,
-    types: Vec<ParticleType>,
-    parent_cells: Vec<usize>,
+    pub velocities: Vec<na::Vector3<f64>>,
+    pub positions: Vec<na::Vector3<f64>>,
+    pub types: Vec<ParticleType>,
+    pub parent_cells: Vec<usize>,
     keepers: Vec<bool>,
 }
 
@@ -94,96 +99,214 @@ impl Particles {
         }
     }
 
-    //     fn collide(&mut self) {
-    //         let mut rng = rand::thread_rng();
-    //         let vec = self.vec;
-    //         let particles = ParticlePointer(self.vec.as_mut_ptr());
-    //         let (collision_indices, mut current_max) = self.collision_index_receiver.recv().unwrap();
-    //         collision_indices.into_iter().for_each(|(p1, p2)| {
-    //             let particle_1 = unsafe { &mut *{ particles }.0.add(p1) };
-    //             let particle_2 = unsafe { &mut *{ particles }.0.add(p2) };
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            velocities: Vec::with_capacity(capacity),
+            positions: Vec::with_capacity(capacity),
+            types: Vec::new(),
+            parent_cells: Vec::new(),
+            keepers: Vec::new(),
+        }
+    }
 
-    //             let relative_velocity = particle_1.velocity - particle_2.velocity;
-    //             let relative_velocity_norm = relative_velocity.norm();
-    //             let collision_rate = sigma_k * relative_velocity_norm;
-    //             let threshold = if collision_rate > current_max {
-    //                 //TODO: if different thread send update here
-    //                 current_max = collision_rate;
-    //                 1.
-    //             } else {
-    //                 collision_rate / current_max
-    //             };
-    //             let r: f64 = rng.gen();
-    //             if r < threshold {
-    //                 // Collision Accepted, adjust particle velocities
-    //                 // Compute center of mass velocity, vcm
-    //                 let center_of_mass = 0.5 * (particle_1.velocity + particle_2.velocity);
-    //                 // Compute random perturbation that conserves momentum
-    //                 let perturbation = random_direction() * relative_velocity_norm;
-    //                 particle_1.velocity = center_of_mass + 0.5 * perturbation;
-    //                 particle_1.velocity = center_of_mass - 0.5 * perturbation;
-    //                 //seems weird but I think this involves fewest comparisons
-    //                 if particle_1.particle_type == ParticleType::Inflow
-    //                     && particle_2.particle_type == ParticleType::Inflow
-    //                 {
-    //                     return;
-    //                 } else {
-    //                     particle_1.particle_type = ParticleType::Ricochet;
-    //                     particle_2.particle_type = ParticleType::Ricochet;
-    //                 }
-    //             }
-    //         });
-    //     }
+    pub fn collide(
+        &mut self,
+        collision_idx_receiver: &CollisionIndexReceiver,
+        collision_max_rate: Arc<DashMap<usize, AtomicU64>>,
+    ) {
+        let mut cell: OnceCell<Vec<Arc<AtomicBool>>> = OnceCell::new();
+        {
+            cell.get_or_init(|| create_parking_lot(self.len()));
+        }
+        let mut plock = cell.get_mut().unwrap();
 
-    fn collide(&mut self, p1: usize, p2: usize, current_max_rate: f64, rng: &mut ThreadRng) -> f64 {
+        grow_parking_lot(plock, self.len());
+
+        //let current_max_ptr = MaxPointer(collision_max_rate.as_mut_ptr());
+        let cell_ptr = ParentCellPointer(self.parent_cells.as_mut_ptr());
+        let velocity_ptr = VectorPointer(self.velocities.as_mut_ptr());
+        let particle_type_ptr = ParticleTypePointer(self.types.as_mut_ptr());
+        let plock_ptr = PlockPointer(unsafe { plock.as_ptr() });
+
+        collision_idx_receiver
+            .into_iter()
+            .par_bridge()
+            .for_each(|big_chunk| {
+                //println!("got chunk: {:?}", big_chunk);
+
+                //used first particle index to figure out what cell the particle belongs to
+                let cell_idx = unsafe { &mut *{ cell_ptr }.0.add(big_chunk[0].0) };
+                //use the cell index to get the current max
+                //let current_max_atomic = unsafe { &*{ current_max_ptr }.0.add(*cell_idx) }; //collision_max_rate[*cell_idx].clone(); //
+                let current_max = f64::from_bits(
+                    collision_max_rate
+                        .get(cell_idx)
+                        .unwrap()
+                        .load(Ordering::Relaxed),
+                );
+
+                big_chunk
+                    .into_par_iter() //.chunks(8).for_each(|lil_chunk| {
+                    //lil_chunk.into_iter()
+                    .for_each(|(p1, p2)| {
+                        let mut rng = rand::thread_rng();
+                        //println!("got collision indices: {:?}", collision_indices);
+                        let lock1 = unsafe { &*{ plock_ptr }.0.add(p1) }.clone();
+                        let lock2 = unsafe { &*{ plock_ptr }.0.add(p2) }.clone();
+
+                        while !lock1.load(Ordering::Acquire) || !lock2.load(Ordering::Acquire) {
+                            println!("idling");
+                            hint::spin_loop();
+                        }
+                        //println!("locking particles {:#?}{:#?}", lock1, lock2);
+                        lock1.store(false, Ordering::Release);
+                        lock2.store(false, Ordering::Release);
+                        //println!("parked thread");
+                        //get the pointers for setting the fields
+                        let velocity1 = unsafe { &mut *{ velocity_ptr }.0.add(p1) };
+                        let ptype1 = unsafe { &mut *{ particle_type_ptr }.0.add(p1) };
+                        let velocity2 = unsafe { &mut *{ velocity_ptr }.0.add(p2) };
+                        let ptype2 = unsafe { &mut *{ particle_type_ptr }.0.add(p2) };
+                        //println!("got the data");
+                        let relative_velocity = *velocity1 - *velocity2;
+                        let relative_velocity_norm = relative_velocity.norm();
+                        let collision_rate = (SIGMA_K * relative_velocity_norm);
+                        let threshold = if current_max.lt(&collision_rate) {
+                            1.
+                        } else {
+                            collision_rate / current_max
+                        };
+                        let r: f64 = rng.gen();
+                        if r < threshold {
+                            // Collision Accepted, adjust particle velocities
+                            // Compute center of mass velocity, vcm
+                            let center_of_mass = 0.5 * (*velocity1 + *velocity2);
+                            // Compute random perturbation that conserves momentum
+                            let perturbation = random_direction(&mut rng) * relative_velocity_norm;
+                            //make sure current
+                            //let lock1 = unsafe { &*{ plock_ptr }.0.add(p1) };
+                            //let lock2 = unsafe { &*{ plock_ptr }.0.add(p2) };
+                            // lock1.park();
+                            // lock2.park();
+                            // Adjust particle velocities to reflect collision
+                            *velocity1 = center_of_mass + 0.5 * perturbation;
+                            *velocity2 = center_of_mass - 0.5 * perturbation;
+
+                            // Bookkeeping to track particle interactions
+                            if *ptype1 != ParticleType::Inflow || *ptype1 != ParticleType::Inflow {
+                                let maxtype = *ptype1.max(ptype2);
+                                *ptype1 = maxtype;
+                                *ptype2 = maxtype;
+                            }
+                        }
+                        if current_max.lt(&collision_rate) {
+                            collision_max_rate
+                                .get(cell_idx)
+                                .unwrap()
+                                .store(collision_rate.to_bits(), Ordering::Relaxed);
+                        }
+                        lock1.store(true, Ordering::Release);
+                        lock2.store(true, Ordering::Release);
+                        //println!("released locks")
+                        //});
+                    })
+            });
+
+        return;
+    }
+
+    // Initialize particles at inflow boundaries
+    /// Create particles at inflow boundary
+    /// This works by creating particles at a ghost cell just before the boundary
+    /// any particles that don't make it into the domain are discarded.
+    pub fn initialize_boundaries(
+        &mut self,
+        num_x: usize,
+        num_y: usize,
+        num_z: usize,
+        mean_velocity: f64,
+        region_temp: f64,
+        mean_particles_per_cell: usize,
+    ) {
+        // TODO: I might be able to avoid resizing the particle containing
+        // data structure by running the functions
+        // move_particles and remove_outside_particles (or similar function)
+        //directly on the generated particles
+
+        let cell: OnceCell<Vec<(f64, f64, f64)>> = OnceCell::new();
+        let outer_range =
+            cell.get_or_init(|| gen_outer_range(num_x, num_y, num_z, mean_particles_per_cell));
+        let growth_amount = outer_range.len() * mean_particles_per_cell;
+        self.reserve(growth_amount);
+        let old_len = self.len();
+
         let Particles {
             velocities,
-            positions: _,
+            positions,
             types,
-            parent_cells: _,
-            keepers: _,
+            parent_cells,
+            keepers,
         } = self;
-        let mut cell: OnceCell<Vec<Arc<Parker>>> = OnceCell::new();
-        let mut plock = cell.get_or_init(|| create_parking_lot(self.len()));
-        if plock.len() < self.len() {
-            grow_parking_lot(plock, lot_size)
+
+        //writing directly to uninitialized memory, do not try this at home
+        let position_ptr = VectorPointer(positions.as_mut_ptr());
+        let velocity_ptr = VectorPointer(velocities.as_mut_ptr());
+        // let particle_type_ptr = ParticleTypePointer(self.types.as_mut_ptr());
+        // let parent_cell_ptr = ParentCellPointer(self.parent_cells.as_mut_ptr());
+        // let keep_ptr = BoolPointer(self.keepers.as_mut_ptr());
+        unsafe {
+            rayon::join(
+                || {
+                    let (vel_buf, pos_buf): (Vec<Vector3<f64>>, Vec<Vector3<f64>>) = outer_range
+                        .into_par_iter()
+                        .map(|(x, y, z)| {
+                            let mut rng = rand::thread_rng();
+                            let position = na::Vector3::<f64>::new(
+                                *x + rng.gen::<f64>(),
+                                *y + rng.gen::<f64>(),
+                                *z + rng.gen::<f64>(),
+                            );
+                            println!("{}", position);
+                            let mut velocity =
+                                random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
+                            velocity.x += mean_velocity;
+                            //start writing to array here
+
+                            //let offset = old_len + i; //some op of i,j
+                            //     println!("offset {:?}", offset);
+                            //let pos = { &mut *{ position_ptr }.0.add(offset) };
+                            //let vel = { &mut *{ velocity_ptr }.0.add(offset) };
+                            //     // let parent_cell = { &mut *{ parent_cell_ptr }.0.add(offset) };
+                            //     // let particle_type =
+                            //     //     unsafe { &mut *{ particle_type_ptr }.0.add(offset) };
+                            //     // let keep = unsafe { &mut *{ keep_ptr }.0.add(offset) };
+
+                            //pos = position;
+                            //vel = velocity;
+
+                            // }
+                            (velocity, position)
+                        })
+                        .unzip();
+                    velocities.par_extend(vel_buf.into_par_iter());
+                    positions.par_extend(pos_buf.into_par_iter());
+                },
+                || {
+                    let stop = old_len + growth_amount;
+                    keepers.par_extend((old_len..stop).into_par_iter().map(|_| true));
+                    parent_cells.par_extend((old_len..stop).into_par_iter().map(|_| 0));
+                    types.par_extend(
+                        (old_len..stop)
+                            .into_par_iter()
+                            .map(|_| ParticleType::default()),
+                    );
+                },
+            );
         }
-        //println!("got collision indices: {:?}", collision_indices);
-        let lock1 = plock[p1].clone();
-        let lock2 = plock[p2].clone();
-        lock1.park();
-        lock2.park();
-        let relative_velocity = velocities[p1] - velocities[p2];
-        let relative_velocity_norm = relative_velocity.norm();
-        let collision_rate: &mut f64 = &mut (SIGMA_K * relative_velocity_norm);
-        let threshold = if current_max_rate.lt(&collision_rate) {
-            1.
-        } else {
-            *collision_rate / current_max_rate
-        };
-        let r: f64 = rng.gen();
-        if r < threshold {
-            // Collision Accepted, adjust particle velocities
-            // Compute center of mass velocity, vcm
-            let center_of_mass = 0.5 * (velocities[p1] + velocities[p2]);
-            // Compute random perturbation that conserves momentum
-            let perturbation = random_direction(rng) * relative_velocity_norm;
 
-            // Adjust particle velocities to reflect collision
-            velocities[p1] = center_of_mass + 0.5 * perturbation;
-            velocities[p2] = center_of_mass - 0.5 * perturbation;
-
-            // Bookkeeping to track particle interactions
-            if types[p1] != ParticleType::Inflow || types[p2] != ParticleType::Inflow {
-                let maxtype = types[p1].max(types[p2]);
-                types[p1] = maxtype;
-                types[p2] = maxtype;
-            }
-        }
-
-        return current_max_rate.max(*collision_rate);
+        //println!("particle count: {:?}", self.len());
     }
-    fn update_postions(&mut self, delta_t: f64, plate_x: f64, plate_dy: f64, plate_dz: f64) {
+    pub fn update_positions(&mut self, delta_t: f64, plate_x: f64, plate_dy: f64, plate_dz: f64) {
         let Particles {
             velocities,
             positions,
@@ -201,7 +324,7 @@ impl Particles {
             .into_par_iter()
             .chunks(4)
             .for_each(|chunk| {
-                chunk.iter().for_each(|i| {
+                chunk.iter().for_each(move |i| {
                     let current_position = unsafe { &mut *{ position_ptr }.0.add(*i) };
                     let current_velocity = unsafe { &mut *{ velocity_ptr }.0.add(*i) };
                     let mut new_position = (*current_position) + (*current_velocity) * delta_t;
@@ -237,7 +360,7 @@ impl Particles {
 
     /// any particles outside of the bounds of the grid need to be discarded as they cannot be indexed.
     /// Since this can happen only at the x=-1 or x=1 boundaries, we only need to check the x coordinate
-    pub(crate) fn filter_particles(&mut self, num_cells: usize) {
+    pub(crate) fn filter_out_of_scope(&mut self, num_cells: usize) {
         // self.vec.sort_by_key(|p| (p.parent_cell));
         // if let Some(cutoff) = particles.iter().rposition(|p| p.parent_cell < num_cells) {
         //     particles.truncate(cutoff + 1);
@@ -249,13 +372,15 @@ impl Particles {
             parent_cells,
             keepers,
         } = self;
-        let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
-        //let mut keep=keepers.iter();
+        //let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
+        println!("Starting filter");
+        println!("keepers: {:?}", keepers);
         rayon::join(
             || {
                 rayon::join(
                     || {
                         let mut keep = keepers.iter();
+
                         velocities.retain(|_| *keep.next().unwrap());
                     },
                     || {
@@ -292,9 +417,9 @@ impl Particles {
     /// 4 12 20    5 13 21
     /// 2 10 18    3 11 19
     /// 0 8  16    1 9  17
-    fn index(
+    pub fn index(
         &mut self,
-        sample_sender: SampleUpdateSender,
+        sample_sender: &SampleUpdateSender,
         num_x: usize,
         num_y: usize,
         num_z: usize,
@@ -374,8 +499,32 @@ impl Particles {
         self.positions[index] = position;
     }
 
-    pub fn len(self) -> usize {
+    pub fn len(&self) -> usize {
         self.parent_cells.len()
+    }
+
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        let Particles {
+            velocities,
+            positions,
+            types,
+            parent_cells,
+            keepers,
+        } = self;
+        rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || velocities.set_len(new_len),
+                            || positions.set_len(new_len),
+                        )
+                    },
+                    || rayon::join(|| types.set_len(new_len), || parent_cells.set_len(new_len)),
+                )
+            },
+            || keepers.reserve(new_len),
+        );
     }
 
     pub fn reserve(&mut self, capacity: usize) {
@@ -405,10 +554,6 @@ impl Particles {
             },
             || keepers.reserve(capacity),
         );
-        self.velocities.reserve(capacity);
-        self.positions.reserve(capacity);
-        self.parent_cells.reserve(capacity);
-        self.types.reserve(capacity);
     }
 
     pub fn par_extend(&mut self, particles: Particles) {
@@ -453,6 +598,22 @@ impl Particles {
     }
 }
 
+impl Display for Particles {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        (0..self.len())
+            .into_iter()
+            .try_for_each(|i| -> Result<(), std::fmt::Error> {
+                write!(
+                    f,
+                    "{} {} {} {}\n",
+                    self.positions[i].x,
+                    self.positions[i].y,
+                    self.positions[i].z,
+                    self.types[i].to_num()
+                )
+            })
+    }
+}
 // We deref to slice so that we can reuse the slice impls
 // impl Deref for Particles {
 //     type Target = [Particle];
