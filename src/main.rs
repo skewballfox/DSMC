@@ -110,7 +110,9 @@ fn main() {
     //let cell_vol: f64 = dx * dy * dz;
     let molecules_per_particle = density * cell_vol / (mean_particles_per_cell as f64);
     //create channels to share between threads
-
+    println!("x {num_x} y {num_y} z {num_z}");
+    println!("dx {dx} dy {dy} z {dz}");
+    println!("celvol {cell_vol} vtemp {region_temp} density {density}");
     // Create simulation data structures
     //let mut particles: Particles = Particles::new(collision_idx_receiver, sample_data_sender);
     let mut particles: Particles = Particles::new();
@@ -458,26 +460,31 @@ fn collide_particles(
 
             //let members = cell_data[i].members.lock().unwrap();
             let cell = unsafe { &mut *{ cell_ptr }.0.add(i) };
-            let member_count = cell.members.len();
-            let current_max =
+            let member_count: usize = cell.members.len();
+            let current_max: f64 =
                 f64::from_bits(collision_max_rate.get(&i).unwrap().load(Ordering::Relaxed));
-            cell.mean_particles = (cell.mean_particles + current_max + member_count as f64) / 2.;
+            cell.mean_particles = (cell.mean_particles + member_count as f64) / 2.;
             let members = &cell_data[i].members;
 
-            let num_selections =
-                (member_count as f64 * cell.mean_particles * molecules_per_particle * delta_t
-                    / cell_vol)
-                    + *remainder;
+            let num_selections: f64 = ((member_count as f64)
+                * cell.mean_particles
+                * current_max
+                * molecules_per_particle
+                * delta_t
+                / cell_vol)
+                + (*remainder);
 
-            let selection_count = num_selections.floor() as usize;
+            let selection_count: usize = num_selections.floor() as usize;
             if member_count > 0 {
-                println!("selection count {:?}", selection_count);
-                println!("num selections {:?}", num_selections);
-                println!("member_count {:?}", member_count);
-                println!("mean particlses {:?}", cell.mean_particles);
-                println!("delta_t {:?}", delta_t);
-                println!("cell vol: {:?}", cell_vol);
-                println!("current max {:?}", current_max);
+                // println!("selection count {:?}", selection_count);
+                // println!("num selections {:?}", num_selections);
+                // println!("member_count {:?}", member_count);
+                // println!("mean particles {:?}", cell.mean_particles);
+                // println!("delta_t {:?}", delta_t);
+                // println!("cell vol: {:?}", cell_vol);
+                // println!("current max {:?}", current_max);
+                // println!("molecules per particle {molecules_per_particle}");
+                // println!("remainder {:?}", *remainder);
             }
             *remainder = num_selections - selection_count as f64;
             if selection_count > 0 {
