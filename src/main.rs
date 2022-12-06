@@ -183,14 +183,9 @@ fn main() {
         num_sample += 1;
         // If time to reset cell samples, reinitialize data
         if num_sample % sample_reset == 0 {
-            initialize_sample(&mut cell_data);
-            println!("filtering particles");
-            let start = Instant::now();
-            // Remove any particles that are now outside of boundaries
-            particles.filter_out_of_scope(number_of_cells);
-            println!("filter took: {:?}", start.elapsed());
             num_sample = 0
         }
+
         println!("starting join index/sample");
         let start = Instant::now();
         // Compute cell index for particles based on their current
@@ -206,6 +201,14 @@ fn main() {
                 || update_sample(&mut cell_data, &sample_receiver.clone()),
             )
         });
+        if n % 4 == 0 {
+            println!("filtering particles");
+
+            let start = Instant::now();
+            // Remove any particles that are now outside of boundaries
+            particles.filter_out_of_scope(number_of_cells);
+            println!("filter took: {:?}", start.elapsed());
+        }
         println!("index/sample took {:?}", start.elapsed());
         //println!("particles {:?}", particles);
 
@@ -365,7 +368,6 @@ fn collide_particles(
     let plock_ptr = PlockPointer(unsafe { plock.as_ptr() });
 
     //1. Visit cells and determine chance that particles can collide
-    println!("starting calc collisions");
     collision_remainder
         .into_par_iter()
         .enumerate()
@@ -524,18 +526,18 @@ fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdate
         //chunk.into_par_iter().chunks(4).for_each(|chunk| {
         chunk.into_iter().for_each(|(cell_idx, particle_idx)| {
             //println!("receiving {:?}", cell_idx);
-            if cell_idx < num_cells {
-                // let cell = unsafe { &*{ cell_ptr }.0.add(cell_idx) };
-                // let guard = Arc::clone(&cell.members);
 
-                // let mut members = guard.lock().unwrap();
-                // if cell_data[cell_idx].members.len() != 0 {
-                //     println!("yup")
-                // }
-                // members.push(particle_idx);
+            // let cell = unsafe { &*{ cell_ptr }.0.add(cell_idx) };
+            // let guard = Arc::clone(&cell.members);
+
+            // let mut members = guard.lock().unwrap();
+            // if cell_data[cell_idx].members.len() != 0 {
+            //     println!("yup")
+            // }
+            if cell_idx != num_cells {
                 cell_data[cell_idx].members.push(particle_idx)
-                //println!("members {:?}", members);
             }
+            //println!("members {:?}", members);
         })
         //});
         //});

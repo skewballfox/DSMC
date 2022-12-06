@@ -12,8 +12,8 @@ use crate::{
     random_direction, random_velocity,
     util::{
         create_parking_lot, gen_outer_range, grow_parking_lot, BoolPointer, CollisionIndexReceiver,
-        ImmutableParentCellPointer, MaxPointer, ParentCellPointer, ParticleTypePointer,
-        PlockPointer, SampleUpdateSender, VectorPointer,
+        ExtendTuple2, ExtendTuple3, ImmutableParentCellPointer, MaxPointer, ParentCellPointer,
+        ParticleTypePointer, PlockPointer, SampleUpdateSender, VectorPointer,
     },
     CellSample, SIGMA_K,
 };
@@ -249,48 +249,44 @@ impl Particles {
         } = self;
 
         //writing directly to uninitialized memory, do not try this at home
-        let position_ptr = VectorPointer(positions.as_mut_ptr());
-        let velocity_ptr = VectorPointer(velocities.as_mut_ptr());
+        //let position_ptr = VectorPointer(positions.as_mut_ptr());
+        //let velocity_ptr = VectorPointer(velocities.as_mut_ptr());
         // let particle_type_ptr = ParticleTypePointer(self.types.as_mut_ptr());
         // let parent_cell_ptr = ParentCellPointer(self.parent_cells.as_mut_ptr());
         // let keep_ptr = BoolPointer(self.keepers.as_mut_ptr());
-        unsafe {
-            rayon::join(
-                || {
-                    let (vel_buf, pos_buf): (Vec<Vector3<f64>>, Vec<Vector3<f64>>) = outer_range
-                        .into_par_iter()
-                        .map(|(x, y, z)| {
-                            let mut rng = rand::thread_rng();
-                            let position = na::Vector3::<f64>::new(
-                                *x + rng.gen::<f64>(),
-                                *y + rng.gen::<f64>(),
-                                *z + rng.gen::<f64>(),
-                            );
-                            //println!("{}", position);
-                            let mut velocity =
-                                random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
-                            velocity.x += mean_velocity;
-                            //start writing to array here
 
-                            // }
-                            (velocity, position)
-                        })
-                        .unzip();
-                    velocities.par_extend(vel_buf.into_par_iter());
-                    positions.par_extend(pos_buf.into_par_iter());
-                },
-                || {
-                    let stop = old_len + growth_amount;
-                    keepers.par_extend((old_len..stop).into_par_iter().map(|_| true));
-                    parent_cells.par_extend((old_len..stop).into_par_iter().map(|_| 0));
-                    types.par_extend(
-                        (old_len..stop)
-                            .into_par_iter()
-                            .map(|_| ParticleType::default()),
-                    );
-                },
-            );
-        }
+        rayon::join(
+            || {
+                ExtendTuple2::new((velocities, positions)).par_extend(
+                    outer_range.into_par_iter().map(|(x, y, z)| {
+                        let mut rng = rand::thread_rng();
+                        let position = na::Vector3::<f64>::new(
+                            *x + rng.gen::<f64>(),
+                            *y + rng.gen::<f64>(),
+                            *z + rng.gen::<f64>(),
+                        );
+                        //println!("{}", position);
+                        let mut velocity =
+                            random_velocity(&mut rng, region_temp) * random_direction(&mut rng);
+                        velocity.x += mean_velocity;
+                        //start writing to array here
+
+                        // }
+                        (velocity, position)
+                    }),
+                );
+
+                //velocities.par_extend(vel_buf.into_par_iter());
+                //positions.par_extend(pos_buf.into_par_iter());
+            },
+            || {
+                ExtendTuple3::new((keepers, parent_cells, types)).par_extend(
+                    (0..growth_amount)
+                        .into_par_iter()
+                        .map(|_| (true, 0, ParticleType::default())),
+                );
+            },
+        );
 
         //println!("particle count: {:?}", self.len());
     }
@@ -298,51 +294,50 @@ impl Particles {
         let Particles {
             velocities,
             positions,
-            types: _,
+            types,
             parent_cells: _,
             keepers: _,
         } = self;
         let particle_count = velocities.len();
 
-        let position_ptr = VectorPointer(positions.as_mut_ptr());
-        let velocity_ptr = VectorPointer(velocities.as_mut_ptr());
-        let particle_type_ptr = ParticleTypePointer(self.types.as_mut_ptr());
+        // let position_ptr = VectorPointer(positions.as_mut_ptr());
+        // let velocity_ptr = VectorPointer(velocities.as_mut_ptr());
+        // let particle_type_ptr = ParticleTypePointer(self.types.as_mut_ptr());
 
-        (0..particle_count)
+        (velocities, positions, types)
             .into_par_iter()
-            .chunks(4)
-            .for_each(|chunk| {
-                chunk.iter().for_each(move |i| {
-                    let current_position = unsafe { &mut *{ position_ptr }.0.add(*i) };
-                    let current_velocity = unsafe { &mut *{ velocity_ptr }.0.add(*i) };
-                    let mut new_position = (*current_position) + (*current_velocity) * delta_t;
+            //.chunks(4)
+            //.for_each(|chunk| {
+            //    chunk
+            //        .iter()
+            .for_each(move |(current_velocity, current_position, ptype)| {
+                let mut new_position = (*current_position) + (*current_velocity) * delta_t;
 
-                    if (current_position.x < plate_x) && (new_position.x > plate_x)
-                        || (current_position.x > plate_x) && (new_position.x < plate_x)
+                if (current_position.x < plate_x) && (new_position.x > plate_x)
+                    || (current_position.x > plate_x) && (new_position.x < plate_x)
+                {
+                    let t =
+                        (current_position[0] - plate_x) / (current_position[0] - new_position[0]);
+                    //create a particle representing the potential position
+                    let tmp = *current_position * (1. - t)
+                        + ((*current_position + delta_t * (*current_velocity)) * t);
+                    if (-plate_dy..plate_dy).contains(&tmp[1])
+                        && (-plate_dz..plate_dz).contains(&tmp[2])
                     {
-                        let t = (current_position[0] - plate_x)
-                            / (current_position[0] - new_position[0]);
-                        //create a particle representing the potential position
-                        let tmp = *current_position * (1. - t)
-                            + ((*current_position + delta_t * (*current_velocity)) * t);
-                        if (-plate_dy..plate_dy).contains(&tmp[1])
-                            && (-plate_dz..plate_dz).contains(&tmp[2])
-                        {
-                            new_position.x -= 2. * new_position.x - plate_x;
-                            current_velocity.x = -current_velocity.x;
-                            let ptype = unsafe { &mut *{ particle_type_ptr }.0.add(*i) };
-                            *ptype = ParticleType::Thud;
-                        }
+                        new_position.x -= 2. * new_position.x - plate_x;
+                        current_velocity.x = -current_velocity.x;
+                        *ptype = ParticleType::Thud;
                     }
+                }
 
-                    if (-1.0..1.).contains(&new_position.y) {
-                        new_position.y -= 2.0;
-                    }
-                    if (-1.0..1.).contains(&new_position.z) {
-                        new_position.z -= 2.0;
-                    }
-                    *current_position = new_position;
-                })
+                if (-1.0..1.).contains(&new_position.y) {
+                    new_position.y -= 2.0;
+                }
+                if (-1.0..1.).contains(&new_position.z) {
+                    new_position.z -= 2.0;
+                }
+                *current_position = new_position;
+                //        })
             });
     }
 
@@ -360,6 +355,13 @@ impl Particles {
             parent_cells,
             keepers,
         } = self;
+        //off_grid;
+        // let mut keep = vec![true; velocity.len()];
+        // let kptr = BoolPointer(keep.as_mut_ptr());
+        // off_grid.into_par_iter().for_each(|i| {
+        //     let mut k = unsafe { &mut *(kptr).0.add(i) };
+        //     *k = false;
+        // });
         //let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
         println!("Starting filter");
         println!("keepers: {:?}", keepers);
@@ -368,7 +370,6 @@ impl Particles {
                 rayon::join(
                     || {
                         let mut keep = keepers.iter();
-
                         velocities.retain(|_| *keep.next().unwrap());
                     },
                     || {
@@ -433,7 +434,7 @@ impl Particles {
         (0..particle_count)
             .into_par_iter()
             .chunks(4)
-            .map(|chunk| {
+            .map(move |chunk| {
                 chunk //iterate syncronously for chunk size
                     .iter()
                     .map(|i| {
@@ -462,6 +463,7 @@ impl Particles {
                         let parent = unsafe { &mut *{ cell_ptr }.0.add(*i) };
                         *parent = cell_membership;
                         if cell_membership == num_cells {
+                            println!("yeet {particle_count}");
                             let keep = unsafe { &mut *{ keep_ptr }.0.add(*i) };
                             *keep = false;
                         }
