@@ -272,18 +272,6 @@ impl Particles {
                             velocity.x += mean_velocity;
                             //start writing to array here
 
-                            //let offset = old_len + i; //some op of i,j
-                            //     println!("offset {:?}", offset);
-                            //let pos = { &mut *{ position_ptr }.0.add(offset) };
-                            //let vel = { &mut *{ velocity_ptr }.0.add(offset) };
-                            //     // let parent_cell = { &mut *{ parent_cell_ptr }.0.add(offset) };
-                            //     // let particle_type =
-                            //     //     unsafe { &mut *{ particle_type_ptr }.0.add(offset) };
-                            //     // let keep = unsafe { &mut *{ keep_ptr }.0.add(offset) };
-
-                            //pos = position;
-                            //vel = velocity;
-
                             // }
                             (velocity, position)
                         })
