@@ -22,6 +22,7 @@ use rayon::prelude::*;
 
 use std::cmp::max;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::hint;
 use std::io::Write;
@@ -190,23 +191,23 @@ fn main() {
         let start = Instant::now();
         // Compute cell index for particles based on their current
         // locations
-
-        rayon::scope(|s| {
-            let (sample_sender, sample_receiver) = unbounded();
-            rayon::join(
-                || {
-                    particles.index(&sample_sender, num_x, num_y, num_z);
-                    drop(sample_sender)
-                },
-                || update_sample(&mut cell_data, &sample_receiver.clone()),
-            )
-        });
+        let membership: Arc<HashMap<usize, Vec<usize>>> = particles.index(num_x, num_y, num_z);
+        // rayon::scope(|s| {
+        //     let (sample_sender, sample_receiver) = unbounded();
+        //     rayon::join(
+        //         || {
+        //             particles.index(&sample_sender, num_x, num_y, num_z);
+        //             drop(sample_sender)
+        //         },
+        //         || update_sample(&mut cell_data, &sample_receiver.clone()),
+        //     );
+        // });
         if n % 4 == 0 {
             println!("filtering particles");
-
+            let drop_list = membership.get(&number_of_cells).unwrap();
             let start = Instant::now();
             // Remove any particles that are now outside of boundaries
-            particles.filter_out_of_scope(number_of_cells);
+            particles.filter_out_of_scope(drop_list);
             println!("filter took: {:?}", start.elapsed());
         }
         println!("index/sample took {:?}", start.elapsed());
@@ -242,22 +243,26 @@ fn main() {
 ///collection of data for cells, total kinetic energy and velocity have been removed
 #[derive(Debug)]
 struct CellSample {
-    mean_particles: f64,
+    mean_particles: Vec<f64>,
     //total_velocity: na::Vector3<f64>,
     //total_kinetic_energy: f64,
-    members: Vec<usize>,
+    members: Arc<HashMap<usize, Vec<usize>>>,
     //members: Arc<Mutex<Vec<usize>>>,
 }
 
 impl CellSample {
     fn new() -> Self {
         Self {
-            mean_particles: 0.,
-            members: Vec::new(),
+            mean_particles: Vec::new(),
+            members: Arc::new(HashMap::new()),
         }
     }
     fn reset(&mut self) {
-        self.mean_particles = 0.;
+        let num_cells = self.mean_particles.len();
+        self.mean_particles = vec![0.; num_cells];
+    }
+    fn len(self) -> usize {
+        self.mean_particles.len()
     }
 }
 
@@ -268,18 +273,20 @@ struct EndSampleData {
 }
 
 impl EndSampleData {
-    fn new(cell_sample_data: &Vec<CellSample>, particles: &Particles) -> Self {
+    fn new(cell_sample_data: CellSample, particles: &Particles) -> Self {
         let mut total_velocity = Vec::with_capacity(cell_sample_data.len());
         let mut total_kinetic_energy = Vec::with_capacity(cell_sample_data.len());
         let mut particle_count = Vec::with_capacity(cell_sample_data.len());
-        for i in (0..cell_sample_data.len()) {
+        for i in 0..cell_sample_data.len() {
             total_velocity[i] = na::Vector3::new(0., 0., 0.);
             total_kinetic_energy[i] = 0.0;
-            particle_count[i] = cell_sample_data[i].members.len();
-            (0..cell_sample_data[i].members.len()).for_each(|k| {
+            let members = cell_sample_data.members.get(&i).unwrap();
+
+            particle_count[i] = members.len();
+            for k in 0..members.len() {
                 total_velocity[i] += particles.velocities[k];
                 total_kinetic_energy[i] += 0.5 * particles.velocities[k].norm();
-            });
+            }
         }
         Self {
             total_velocity,

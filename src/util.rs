@@ -66,7 +66,10 @@ unsafe impl Sync for ImmutableParentCellPointer {}
 pub(crate) struct VectorPointer(pub(crate) *mut Vector3<f64>);
 unsafe impl Send for VectorPointer {}
 unsafe impl Sync for VectorPointer {}
-
+#[derive(Copy, Clone)]
+pub(crate) struct ImmutableVectorPointer(pub(crate) *const Vector3<f64>);
+unsafe impl Send for ImmutableVectorPointer {}
+unsafe impl Sync for ImmutableVectorPointer {}
 #[derive(Copy, Clone)]
 pub(crate) struct ParticleTypePointer(pub(crate) *mut ParticleType);
 unsafe impl Send for ParticleTypePointer {}
