@@ -58,6 +58,11 @@ unsafe impl Send for ParentCellPointer {}
 unsafe impl Sync for ParentCellPointer {}
 
 #[derive(Copy, Clone)]
+pub(crate) struct CellMeanPointer(pub(crate) *mut f64);
+unsafe impl Send for CellMeanPointer {}
+unsafe impl Sync for CellMeanPointer {}
+
+#[derive(Copy, Clone)]
 pub(crate) struct ImmutableParentCellPointer(pub(crate) *const usize);
 unsafe impl Send for ImmutableParentCellPointer {}
 unsafe impl Sync for ImmutableParentCellPointer {}

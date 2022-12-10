@@ -344,28 +344,32 @@ impl Particles {
         off_grid.into_par_iter().for_each(move |i| {
             let k = unsafe { &mut *(kptr.clone()).0.add(*i) };
             *k = false;
+            println!("k: {}", *k);
         });
+        let mut tmp_vel = Vec::with_capacity(velocities.len());
+        let mut tmp_pos = Vec::with_capacity(velocities.len());
+        let mut tmp_typ = Vec::with_capacity(velocities.len());
         //let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
         println!("Starting filter");
-        println!("keep: {:?}", keep);
-        rayon::join(
-            || {
-                rayon::join(
-                    || {
-                        let mut keep = keep.iter();
-                        velocities.retain(|_| *keep.next().unwrap());
+        //println!("keep: {:?}", keep);
+        ExtendTuple3::new((&mut tmp_vel, &mut tmp_pos, &mut tmp_typ)).par_extend(
+            (velocities, positions, types, keep)
+                .into_par_iter()
+                .filter_map(
+                    |(vel, pos, typ, keep)| {
+                        if keep {
+                            Some((vel, pos, typ))
+                        } else {
+                            None
+                        }
                     },
-                    || {
-                        let mut keep = keep.iter();
-                        positions.retain(|_| *keep.next().unwrap());
-                    },
-                )
-            },
-            || {
-                let mut keep = keep.iter();
-                types.retain(|_| *keep.next().unwrap());
-            },
+                ),
         );
+        Self {
+            velocities: tmp_vel,
+            positions: tmp_pos,
+            types: tmp_typ,
+        };
     }
 
     ///cell membership goes like this:

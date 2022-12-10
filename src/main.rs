@@ -1,6 +1,4 @@
-//#![feature(drain_filter)]
 //TODO: remove this once I have some working code
-
 mod particles;
 mod util;
 
@@ -117,7 +115,7 @@ fn main() {
     // Create simulation data structures
     //let mut particles: Particles = Particles::new(collision_idx_receiver, sample_data_sender);
     let mut particles: Particles = Particles::new();
-    let mut cell_data: Vec<CellSample> = Vec::with_capacity(number_of_cells);
+    let mut cell_data: CellSample = CellSample::new(number_of_cells);
     println!("{:?}", number_of_cells);
     let mut collision_remainder: Vec<f64> = Vec::with_capacity(number_of_cells);
     let mut collision_max_rate: Arc<DashMap<usize, AtomicU64>> =
@@ -127,7 +125,6 @@ fn main() {
     for i in 0..number_of_cells {
         collision_max_rate.insert(i, AtomicU64::new((SIGMA_K * region_temp).to_bits()));
         collision_remainder.push(rand::random::<f64>());
-        cell_data.push(CellSample::new());
     }
 
     //let mut collision_data: CollisionData = CollisionData::new(number_of_cells, region_temp);
@@ -157,19 +154,16 @@ fn main() {
         );
         let start = Instant::now();
         // Add particles at inflow boundaries
-        rayon::join(
-            || {
-                particles.initialize_boundaries(
-                    num_x,
-                    num_y,
-                    num_z,
-                    mean_velocity,
-                    region_temp,
-                    mean_particles_per_cell,
-                )
-            },
-            || clear_cell_members(&mut cell_data),
+
+        particles.initialize_boundaries(
+            num_x,
+            num_y,
+            num_z,
+            mean_velocity,
+            region_temp,
+            mean_particles_per_cell,
         );
+
         println!(
             "initialization took {:?}, paricle count: {}",
             start.elapsed(),
@@ -191,7 +185,7 @@ fn main() {
         let start = Instant::now();
         // Compute cell index for particles based on their current
         // locations
-        let membership: Arc<HashMap<usize, Vec<usize>>> = particles.index(num_x, num_y, num_z);
+        cell_data.members = particles.index(num_x, num_y, num_z);
         // rayon::scope(|s| {
         //     let (sample_sender, sample_receiver) = unbounded();
         //     rayon::join(
@@ -203,12 +197,14 @@ fn main() {
         //     );
         // });
         if n % 4 == 0 {
-            println!("filtering particles");
-            let drop_list = membership.get(&number_of_cells).unwrap();
-            let start = Instant::now();
+            if let Some(drop_list) = cell_data.members.get(&number_of_cells) {
+                println!("filtering particles");
+                let start = Instant::now();
+                particles.filter_out_of_scope(drop_list);
+                println!("filter took: {:?}", start.elapsed());
+            };
+
             // Remove any particles that are now outside of boundaries
-            particles.filter_out_of_scope(drop_list);
-            println!("filter took: {:?}", start.elapsed());
         }
         println!("index/sample took {:?}", start.elapsed());
         //println!("particles {:?}", particles);
@@ -231,7 +227,7 @@ fn main() {
         println!("finished iter {:?}", n);
     });
     println!("finished");
-    let sample_data = EndSampleData::new(&cell_data, &particles);
+    let sample_data = EndSampleData::new(cell_data, &particles);
     //-------------------------WRITE RESULTS--------------------------------------
     //----------------------------------------------------------------------------
 
@@ -251,9 +247,9 @@ struct CellSample {
 }
 
 impl CellSample {
-    fn new() -> Self {
+    fn new(num_cells: usize) -> Self {
         Self {
-            mean_particles: Vec::new(),
+            mean_particles: vec![0.0; num_cells],
             members: Arc::new(HashMap::new()),
         }
     }
@@ -261,7 +257,7 @@ impl CellSample {
         let num_cells = self.mean_particles.len();
         self.mean_particles = vec![0.; num_cells];
     }
-    fn len(self) -> usize {
+    fn len(&self) -> usize {
         self.mean_particles.len()
     }
 }
@@ -350,7 +346,7 @@ fn remove_outside_particles(particles: &mut Vec<Particle>, num_cells: usize) {
 fn collide_particles(
     particles: &mut Particles,
     collision_remainder: &mut Vec<f64>,
-    cell_data: &mut Vec<CellSample>,
+    cell_data: &mut CellSample,
     molecules_per_particle: f64,
     collision_max_rate: Arc<DashMap<usize, AtomicU64>>,
     num_sample: i32,
@@ -367,9 +363,12 @@ fn collide_particles(
 
     let number_of_cells = cell_data.len();
     //for the calc collison part
-    let cell_ptr = CellPointer(cell_data.as_mut_ptr());
-    //for the particles part
-    //let ce_ptr = ParentCellPointer(self.parent_cells.as_mut_ptr());
+
+    let CellSample {
+        mean_particles,
+        members,
+    } = cell_data;
+    let cell_ptr = CellMeanPointer(cell_data.mean_particles.as_mut_ptr());
     let velocity_ptr = VectorPointer(particles.velocities.as_mut_ptr());
     let particle_type_ptr = ParticleTypePointer(particles.types.as_mut_ptr());
     let plock_ptr = PlockPointer(unsafe { plock.as_ptr() });
@@ -383,138 +382,144 @@ fn collide_particles(
             // collision tests
 
             //let members = cell_data[i].members.lock().unwrap();
-            let cell = unsafe { &mut *{ cell_ptr }.0.add(i) };
-            let member_count: usize = cell.members.len();
-            let current_max: f64 =
-                f64::from_bits(collision_max_rate.get(&i).unwrap().load(Ordering::Relaxed));
-            cell.mean_particles = (cell.mean_particles + member_count as f64) / 2.;
-            let members = &cell_data[i].members;
+            //this calculation is only done if members.len() isn't zero, otherwise num_selctions
+            //gets zeroed out and remainder doesn't change, so this should save a bit of computation
+            //for empty cells
+            if let Some(idx_vec) = members.get(&i) {
+                let member_count = idx_vec.len();
+                let current_max: f64 =
+                    f64::from_bits(collision_max_rate.get(&i).unwrap().load(Ordering::Relaxed));
+                let cell_mean = unsafe { &mut *{ cell_ptr }.0.add(i) };
+                *cell_mean = (*cell_mean + member_count as f64) / 2.;
 
-            let num_selections: f64 = ((member_count as f64)
-                * cell.mean_particles
-                * current_max
-                * molecules_per_particle
-                * delta_t
-                / cell_vol)
-                + (*remainder);
+                let num_selections: f64 = ((member_count as f64)
+                    * (*cell_mean)
+                    * current_max
+                    * molecules_per_particle
+                    * delta_t
+                    / cell_vol)
+                    + (*remainder);
 
-            let selection_count: usize = num_selections.floor() as usize;
-            if member_count > 0 {
-                // println!("selection count {:?}", selection_count);
-                // println!("num selections {:?}", num_selections);
-                // println!("member_count {:?}", member_count);
-                // println!("mean particles {:?}", cell.mean_particles);
-                // println!("delta_t {:?}", delta_t);
-                // println!("cell vol: {:?}", cell_vol);
-                // println!("current max {:?}", current_max);
-                // println!("molecules per particle {molecules_per_particle}");
-                // println!("remainder {:?}", *remainder);
-            }
-            *remainder = num_selections - selection_count as f64;
-            if selection_count > 0 {
-                if members.len() < 2 {
-                    *remainder += num_selections;
-                } else {
-                    // Select nselect particles for possible collision
+                let selection_count: usize = num_selections.floor() as usize;
+                *remainder = num_selections - selection_count as f64;
+                if selection_count > 0 {
+                    if members.len() < 2 {
+                        *remainder += num_selections;
+                    } else {
+                        // Select nselect particles for possible collision
 
-                    //2. Sample particles for collision and perform collision
-                    //  collision is a random process where the result of
-                    //  a collision conserves momentum and kinetic energy
-                    let collision_indices = (0..selection_count)
-                        .into_par_iter()
-                        .map(|c| -> (usize, usize) {
-                            let mut rng = &mut rand::thread_rng();
-                            // select two points in the cell
-                            let cell_indices = rand::seq::index::sample(rng, members.len(), 2);
-                            let p1 = members[*(&cell_indices.index(0))];
-                            let p2 = members[*(&cell_indices.index(1))];
-                            (p1, p2)
-                        })
-                        .chunks(8 * 128)
-                        .for_each(|chunk| {
-                            //println!("got collision indices: {:?}", chunk);
-                            //used first particle index to figure out what cell the particle belongs to
-                            let cell_idx = i;
-                            //use the cell index to get the current max
-                            //let current_max_atomic = unsafe { &*{ current_max_ptr }.0.add(*cell_idx) }; //collision_max_rate[*cell_idx].clone(); //
-                            let current_max = f64::from_bits(
-                                collision_max_rate
-                                    .get(&cell_idx)
-                                    .unwrap()
-                                    .load(Ordering::Relaxed),
-                            );
-                            chunk.into_par_iter().chunks(8).for_each(|lil_chunk| {
-                                lil_chunk.into_iter().for_each(|(p1, p2)| {
-                                    let mut rng = rand::thread_rng();
-                                    //println!("got collision indices: {:?}", collision_indices);
-                                    let lock1 = unsafe { &*{ plock_ptr }.0.add(p1) }.clone();
-                                    let lock2 = unsafe { &*{ plock_ptr }.0.add(p2) }.clone();
-
-                                    while !lock1.load(Ordering::Acquire)
-                                        || !lock2.load(Ordering::Acquire)
-                                    {
-                                        //println!("idling");
-                                        hint::spin_loop();
-                                    }
-                                    //println!("locking particles {:?}{:?}", p1, p2);
-                                    lock1.store(false, Ordering::Release);
-                                    lock2.store(false, Ordering::Release);
-                                    //println!("parked thread");
-                                    //get the pointers for setting the fields
-                                    let velocity1 = unsafe { &mut *{ velocity_ptr }.0.add(p1) };
-                                    let ptype1 = unsafe { &mut *{ particle_type_ptr }.0.add(p1) };
-                                    let velocity2 = unsafe { &mut *{ velocity_ptr }.0.add(p2) };
-                                    let ptype2 = unsafe { &mut *{ particle_type_ptr }.0.add(p2) };
-                                    //println!("got the data");
-                                    let relative_velocity = *velocity1 - *velocity2;
-                                    let relative_velocity_norm = relative_velocity.norm();
-                                    let collision_rate = (SIGMA_K * relative_velocity_norm);
-                                    let threshold = if current_max.lt(&collision_rate) {
-                                        1.
-                                    } else {
-                                        collision_rate / current_max
-                                    };
-                                    let r: f64 = rng.gen();
-                                    if r < threshold {
-                                        // Collision Accepted, adjust particle velocities
-                                        // Compute center of mass velocity, vcm
-                                        let center_of_mass = 0.5 * (*velocity1 + *velocity2);
-                                        // Compute random perturbation that conserves momentum
-                                        let perturbation =
-                                            random_direction(&mut rng) * relative_velocity_norm;
-                                        //make sure current particle isn't mutably accessed
-
-                                        // Adjust particle velocities to reflect collision
-                                        *velocity1 = center_of_mass + 0.5 * perturbation;
-                                        *velocity2 = center_of_mass - 0.5 * perturbation;
-
-                                        // Bookkeeping to track particle interactions
-                                        if *ptype1 != ParticleType::Inflow
-                                            || *ptype1 != ParticleType::Inflow
-                                        {
-                                            let maxtype = *ptype1.max(ptype2);
-                                            *ptype1 = maxtype;
-                                            *ptype2 = maxtype;
-                                        }
-                                    }
-                                    if current_max.lt(&collision_rate) {
-                                        collision_max_rate
-                                            .get(&cell_idx)
-                                            .unwrap()
-                                            .store(collision_rate.to_bits(), Ordering::Relaxed);
-                                    }
-                                    lock1.store(true, Ordering::Release);
-                                    lock2.store(true, Ordering::Release);
-                                    //println!("released locks")
-                                    //});
-                                });
+                        //2. Sample particles for collision and perform collision
+                        //  collision is a random process where the result of
+                        //  a collision conserves momentum and kinetic energy
+                        (0..selection_count)
+                            .into_par_iter()
+                            .map(|c| -> (usize, usize) {
+                                let mut rng = &mut rand::thread_rng();
+                                // select two points in the cell
+                                let cell_indices = rand::seq::index::sample(rng, idx_vec.len(), 2);
+                                let p1 = idx_vec[*(&cell_indices.index(0))];
+                                let p2 = idx_vec[*(&cell_indices.index(1))];
+                                (p1, p2)
                             })
-                        });
+                            .chunks(8 * 128)
+                            .for_each(|chunk| {
+                                //println!("got collision indices: {:?}", chunk);
+                                //used first particle index to figure out what cell the particle belongs to
+                                let cell_idx = i;
+                                //use the cell index to get the current max
+                                //let current_max_atomic = unsafe { &*{ current_max_ptr }.0.add(*cell_idx) }; //collision_max_rate[*cell_idx].clone(); //
+                                let current_max = f64::from_bits(
+                                    collision_max_rate
+                                        .get(&cell_idx)
+                                        .unwrap()
+                                        .load(Ordering::Relaxed),
+                                );
+                                chunk.into_par_iter().chunks(8).for_each(|lil_chunk| {
+                                    lil_chunk.into_iter().for_each(|(p1, p2)| {
+                                        let mut rng = rand::thread_rng();
+                                        //println!("got collision indices: {:?}", collision_indices);
+                                        let lock1 = unsafe { &*{ plock_ptr }.0.add(p1) }.clone();
+                                        let lock2 = unsafe { &*{ plock_ptr }.0.add(p2) }.clone();
 
-                    //collision_data.max_collision_rate[i] =
-                    //collide(current_max_rate, collision_indices, particles, rng);
+                                        while !lock1.load(Ordering::Acquire)
+                                            || !lock2.load(Ordering::Acquire)
+                                        {
+                                            //println!("idling");
+                                            hint::spin_loop();
+                                        }
+                                        //println!("locking particles {:?}{:?}", p1, p2);
+                                        lock1.store(false, Ordering::Release);
+                                        lock2.store(false, Ordering::Release);
+                                        //println!("parked thread");
+                                        //get the pointers for setting the fields
+                                        let velocity1 = unsafe { &mut *{ velocity_ptr }.0.add(p1) };
+                                        let ptype1 =
+                                            unsafe { &mut *{ particle_type_ptr }.0.add(p1) };
+                                        let velocity2 = unsafe { &mut *{ velocity_ptr }.0.add(p2) };
+                                        let ptype2 =
+                                            unsafe { &mut *{ particle_type_ptr }.0.add(p2) };
+                                        //println!("got the data");
+                                        let relative_velocity = *velocity1 - *velocity2;
+                                        let relative_velocity_norm = relative_velocity.norm();
+                                        let collision_rate = (SIGMA_K * relative_velocity_norm);
+                                        let threshold = if current_max.lt(&collision_rate) {
+                                            1.
+                                        } else {
+                                            collision_rate / current_max
+                                        };
+                                        let r: f64 = rng.gen();
+                                        if r < threshold {
+                                            // Collision Accepted, adjust particle velocities
+                                            // Compute center of mass velocity, vcm
+                                            let center_of_mass = 0.5 * (*velocity1 + *velocity2);
+                                            // Compute random perturbation that conserves momentum
+                                            let perturbation =
+                                                random_direction(&mut rng) * relative_velocity_norm;
+                                            //make sure current particle isn't mutably accessed
+
+                                            // Adjust particle velocities to reflect collision
+                                            *velocity1 = center_of_mass + 0.5 * perturbation;
+                                            *velocity2 = center_of_mass - 0.5 * perturbation;
+
+                                            // Bookkeeping to track particle interactions
+                                            if *ptype1 != ParticleType::Inflow
+                                                || *ptype1 != ParticleType::Inflow
+                                            {
+                                                let maxtype = *ptype1.max(ptype2);
+                                                *ptype1 = maxtype;
+                                                *ptype2 = maxtype;
+                                            }
+                                        }
+                                        if current_max.lt(&collision_rate) {
+                                            collision_max_rate
+                                                .get(&cell_idx)
+                                                .unwrap()
+                                                .store(collision_rate.to_bits(), Ordering::Relaxed);
+                                        }
+                                        lock1.store(true, Ordering::Release);
+                                        lock2.store(true, Ordering::Release);
+                                        //println!("released locks")
+                                        //});
+                                    });
+                                })
+                            });
+
+                        //collision_data.max_collision_rate[i] =
+                        //collide(current_max_rate, collision_indices, particles, rng);
+                    }
                 }
-            }
+            };
+
+            // println!("selection count {:?}", selection_count);
+            // println!("num selections {:?}", num_selections);
+            // println!("member_count {:?}", member_count);
+            // println!("mean particles {:?}", cell.mean_particles);
+            // println!("delta_t {:?}", delta_t);
+            // println!("cell vol: {:?}", cell_vol);
+            // println!("current max {:?}", current_max);
+            // println!("molecules per particle {molecules_per_particle}");
+            // println!("remainder {:?}", *remainder);
+            //}
         });
     //println!("end_reached");
 }
@@ -526,30 +531,30 @@ fn initialize_sample(cell_data: &mut Vec<CellSample>) {
     }
 }
 
-fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdateReceiver) {
-    let cell_ptr = CellPointer(cell_data.as_mut_ptr());
-    let num_cells = cell_data.len();
-    sample_reciever.into_iter().for_each(|chunk| {
-        //chunk.into_par_iter().chunks(4).for_each(|chunk| {
-        chunk.into_iter().for_each(|(cell_idx, particle_idx)| {
-            //println!("receiving {:?}", cell_idx);
+// fn update_sample(cell_data: &mut Vec<CellSample>, sample_reciever: &SampleUpdateReceiver) {
+//     let cell_ptr = CellPointer(cell_data.as_mut_ptr());
+//     let num_cells = cell_data.len();
+//     sample_reciever.into_iter().for_each(|chunk| {
+//         //chunk.into_par_iter().chunks(4).for_each(|chunk| {
+//         chunk.into_iter().for_each(|(cell_idx, particle_idx)| {
+//             //println!("receiving {:?}", cell_idx);
 
-            // let cell = unsafe { &*{ cell_ptr }.0.add(cell_idx) };
-            // let guard = Arc::clone(&cell.members);
+//             // let cell = unsafe { &*{ cell_ptr }.0.add(cell_idx) };
+//             // let guard = Arc::clone(&cell.members);
 
-            // let mut members = guard.lock().unwrap();
-            // if cell_data[cell_idx].members.len() != 0 {
-            //     println!("yup")
-            // }
-            if cell_idx != num_cells {
-                cell_data[cell_idx].members.push(particle_idx)
-            }
-            //println!("members {:?}", members);
-        })
-        //});
-        //});
-    });
-}
+//             // let mut members = guard.lock().unwrap();
+//             // if cell_data[cell_idx].members.len() != 0 {
+//             //     println!("yup")
+//             // }
+//             if cell_idx != num_cells {
+//                 cell_data[cell_idx].members.push(particle_idx)
+//             }
+//             //println!("members {:?}", members);
+//         })
+//         //});
+//         //});
+//     });
+// }
 
 fn write_particle_data(file_name: String, particles: Particles) -> std::io::Result<()> {
     let mut write_buf = Vec::new();
@@ -584,10 +589,10 @@ fn write_sample_data(file_name: String, sample_data: EndSampleData) -> std::io::
     Ok(())
 }
 
-fn clear_cell_members(cell_data: &mut Vec<CellSample>) {
-    cell_data.into_par_iter().for_each(|cell| {
-        //let mut members = cell.members.lock().unwrap();
-        //members.clear();
-        cell.members.clear()
-    });
-}
+// fn clear_cell_members(cell_data: &mut Vec<CellSample>) {
+//     cell_data.into_par_iter().for_each(|cell| {
+//         //let mut members = cell.members.lock().unwrap();
+//         //members.clear();
+//         cell.members.clear()
+//     });
+// }
