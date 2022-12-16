@@ -82,7 +82,6 @@ impl Particle {
 
 #[derive(Debug)]
 pub struct Particles {
-    //receiver: ThingBuf,
     pub velocities: Vec<na::Vector3<f64>>,
     pub positions: Vec<na::Vector3<f64>>,
     pub types: Vec<ParticleType>,
@@ -341,35 +340,35 @@ impl Particles {
         //off_grid;
         let mut keep: Vec<bool> = vec![true; velocities.len()];
         let kptr: BoolPointer = BoolPointer(keep.as_mut_ptr());
-        off_grid.into_par_iter().for_each(move |i| {
-            let k = unsafe { &mut *(kptr.clone()).0.add(*i) };
-            *k = false;
-            println!("k: {}", *k);
-        });
-        let mut tmp_vel = Vec::with_capacity(velocities.len());
-        let mut tmp_pos = Vec::with_capacity(velocities.len());
-        let mut tmp_typ = Vec::with_capacity(velocities.len());
+        for i in off_grid.iter() {
+            keep[*i] = false;
+        }
+        //let mut tmp_vel = Vec::with_capacity(velocities.len());
+        //let mut tmp_pos = Vec::with_capacity(velocities.len());
+        //let mut tmp_typ = Vec::with_capacity(velocities.len());
         //let cell_ptr = ParentCellPointer(parent_cells.as_mut_ptr());
-        println!("Starting filter");
+
         //println!("keep: {:?}", keep);
-        ExtendTuple3::new((&mut tmp_vel, &mut tmp_pos, &mut tmp_typ)).par_extend(
-            (velocities, positions, types, keep)
-                .into_par_iter()
-                .filter_map(
-                    |(vel, pos, typ, keep)| {
-                        if keep {
-                            Some((vel, pos, typ))
-                        } else {
-                            None
-                        }
-                    },
-                ),
+
+        let (tmp_vel, (tmp_pos, tmp_typ)) = (velocities, positions, types, keep)
+            .into_par_iter()
+            .filter_map(|(vel, pos, typ, keep)| {
+                if keep {
+                    Some((*vel, (*pos, *typ)))
+                } else {
+                    None
+                }
+            })
+            .unzip();
+
+        std::mem::replace(
+            self,
+            Particles {
+                velocities: tmp_vel,
+                positions: tmp_pos,
+                types: tmp_typ,
+            },
         );
-        Self {
-            velocities: tmp_vel,
-            positions: tmp_pos,
-            types: tmp_typ,
-        };
     }
 
     ///cell membership goes like this:

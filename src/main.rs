@@ -196,17 +196,19 @@ fn main() {
         //         || update_sample(&mut cell_data, &sample_receiver.clone()),
         //     );
         // });
+        println!("index/sample took {:?}", start.elapsed());
         if n % 4 == 0 {
             if let Some(drop_list) = cell_data.members.get(&number_of_cells) {
                 println!("filtering particles");
                 let start = Instant::now();
                 particles.filter_out_of_scope(drop_list);
                 println!("filter took: {:?}", start.elapsed());
+                println!("new particle count: {}", particles.len());
             };
 
             // Remove any particles that are now outside of boundaries
         }
-        println!("index/sample took {:?}", start.elapsed());
+
         //println!("particles {:?}", particles);
 
         //println!("members {:?}", cell_data);
