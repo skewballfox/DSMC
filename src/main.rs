@@ -169,6 +169,16 @@ fn main() {
             start.elapsed(),
             particles.len()
         );
+        if n % 4 == 0 {
+            // Remove any particles that are now outside of boundaries
+            if let Some(drop_list) = cell_data.members.get(&number_of_cells) {
+                println!("filtering particles");
+                let start = Instant::now();
+                particles.filter_out_of_scope(drop_list);
+                println!("filter took: {:?}", start.elapsed());
+                println!("new particle count: {}", particles.len());
+            };
+        }
         // Move particles
         println!("updating positions");
         let start = Instant::now();
@@ -197,17 +207,6 @@ fn main() {
         //     );
         // });
         println!("index/sample took {:?}", start.elapsed());
-        if n % 4 == 0 {
-            if let Some(drop_list) = cell_data.members.get(&number_of_cells) {
-                println!("filtering particles");
-                let start = Instant::now();
-                particles.filter_out_of_scope(drop_list);
-                println!("filter took: {:?}", start.elapsed());
-                println!("new particle count: {}", particles.len());
-            };
-
-            // Remove any particles that are now outside of boundaries
-        }
 
         //println!("particles {:?}", particles);
 
@@ -273,18 +272,20 @@ struct EndSampleData {
 impl EndSampleData {
     fn new(cell_sample_data: CellSample, particles: &Particles) -> Self {
         let mut total_velocity = Vec::with_capacity(cell_sample_data.len());
-        let mut total_kinetic_energy = Vec::with_capacity(cell_sample_data.len());
-        let mut particle_count = Vec::with_capacity(cell_sample_data.len());
+        let mut total_kinetic_energy = vec![0.0; cell_sample_data.len()];
+        let mut particle_count = vec![0; cell_sample_data.len()];
         for i in 0..cell_sample_data.len() {
-            total_velocity[i] = na::Vector3::new(0., 0., 0.);
-            total_kinetic_energy[i] = 0.0;
-            let members = cell_sample_data.members.get(&i).unwrap();
-
-            particle_count[i] = members.len();
-            for k in 0..members.len() {
-                total_velocity[i] += particles.velocities[k];
-                total_kinetic_energy[i] += 0.5 * particles.velocities[k].norm();
-            }
+            let mut total_vel = na::Vector3::new(0., 0., 0.);
+            if let Some(members) = cell_sample_data.members.get(&i) {
+                particle_count[i] = members.len();
+                for k in 0..members.len() {
+                    total_vel += particles.velocities[k];
+                    total_kinetic_energy[i] += 0.5 * particles.velocities[k].norm();
+                }
+                total_velocity.push(total_vel);
+            } else {
+                println!("empty cell {}", i);
+            };
         }
         Self {
             total_velocity,
@@ -405,7 +406,7 @@ fn collide_particles(
                 let selection_count: usize = num_selections.floor() as usize;
                 *remainder = num_selections - selection_count as f64;
                 if selection_count > 0 {
-                    if members.len() < 2 {
+                    if idx_vec.len() < 2 {
                         *remainder += num_selections;
                     } else {
                         // Select nselect particles for possible collision
